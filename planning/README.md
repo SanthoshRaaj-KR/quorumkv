@@ -1,0 +1,54 @@
+# quorumkv — planning notes
+
+The middle layer between `DESIGN.md` (the *why*) and the code. One file per
+phase from `ROADMAP.md`. Each file answers: **what are the real algorithm
+choices here, which one do we pick, and how do we build it?**
+
+Depth is **medium**: options + tradeoffs + a recommended pick + a prose
+implementation walkthrough. Not byte-level spec — we go deeper only where a
+phase genuinely needs it (WAL framing, SSTable layout, the Rust/Go seam).
+
+## How to read a phase file
+
+Every phase file has the same shape:
+
+1. **Goal** — the one concept (from ROADMAP).
+2. **Algorithm options** — the real forks, as a comparison table.
+3. **Recommendation** — what we pick and why.
+4. **Implementation approach** — how to actually build it.
+5. **Edge cases** — the things that bite.
+6. **Test plan** — expanding "done when…" into runnable cases.
+
+## Phases
+
+| # | File | Concept | Status |
+|---|---|---|---|
+| 1 | [phase-01-wal.md](phase-01-wal.md) | Write-ahead log / durability | decisions locked |
+| 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | drafted |
+| 3 | phase-03-sstable.md | Flush to immutable disk file | todo |
+| 4 | phase-04-bloom.md | Skip files you don't need | todo |
+| 5 | phase-05-compaction.md | Storage-engine GC | todo |
+| 6 | phase-06-raft-single.md | Raft state machine, isolated | todo |
+| 7 | phase-07-election.md | Leader election over RPC | todo |
+| 8 | phase-08-replication.md | Agree on one ordered log | todo |
+| 9 | phase-09-snapshot.md | Stop the log growing forever | todo |
+| 10 | phase-10-apply-seam.md | Connect Raft `apply` → LSM | todo |
+| 11 | phase-11-client.md | Usable from outside | todo |
+| 12 | phase-12-chaos.md | Prove it under failure | todo |
+
+## Decision log
+
+Decisions get made *inside* the phase that needs them and recorded here so we
+never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
+
+| Decision | Phase | Choice | Status |
+|---|---|---|---|
+| WAL framing | 1 | Length-prefix | locked |
+| WAL checksum | 1 | CRC32C per record | locked |
+| WAL durability | 1 | fsync per commit (group-commit later) | locked |
+| Memtable structure | 2 | BTreeMap to start | tentative |
+| SSTable block/index format | 3 | TBD | open |
+| Bloom filter variant | 4 | TBD | open |
+| Compaction strategy | 5 | Size-tiered to start | tentative |
+| Rust ↔ Go boundary | 10 | TBD | open |
+| Read consistency mode | 11 | Leader-only to start | tentative |
