@@ -25,7 +25,7 @@ Every phase file has the same shape:
 |---|---|---|---|
 | 1 | [phase-01-wal.md](phase-01-wal.md) | Write-ahead log / durability | decisions locked |
 | 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | decisions locked |
-| 3 | phase-03-sstable.md | Flush to immutable disk file | todo |
+| 3 | [phase-03-sstable.md](phase-03-sstable.md) | Flush to immutable disk file | decisions locked |
 | 4 | phase-04-bloom.md | Skip files you don't need | todo |
 | 5 | phase-05-compaction.md | Storage-engine GC | todo |
 | 6 | phase-06-raft-single.md | Raft state machine, isolated | todo |
@@ -51,7 +51,12 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Size counter | 2 | AtomicUsize owned by Memtable; +OVERHEAD/entry | locked |
 | Flush threshold | 2 | 64MB, configurable | locked |
 | WAL serialization (consequence) | 2 | mutex around append+fsync; group-commit deferred | noted |
-| SSTable block/index format | 3 | TBD | open |
+| SSTable layout | 3 | data blocks → sparse index → fixed footer | locked |
+| SSTable index density | 3 | sparse (one entry per ~4KB block) | locked |
+| Tombstone persistence | 3 | written to SSTable, dropped only in compaction | locked |
+| File set tracking | 3 | monotonic file numbers + list-and-sort; MANIFEST → Phase 5 | locked |
+| WAL segmentation | 3 | per-memtable segment, deleted after SSTable durable | locked |
+| Flush timing | 3 | synchronous inline; background flush deferred | locked |
 | Bloom filter variant | 4 | TBD | open |
 | Compaction strategy | 5 | Size-tiered to start | tentative |
 | Rust ↔ Go boundary | 10 | TBD | open |
