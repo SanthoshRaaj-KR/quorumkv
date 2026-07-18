@@ -62,6 +62,9 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Bloom tuning | 4 | ~10 bits/key (config), k≈6-7 | locked |
 | Bloom keys | 4 | every key incl. tombstones (no false negatives) | locked |
 | Bloom in file | 4 | new Bloom block + footer offset; CRC32C, rebuildable | locked |
-| Compaction strategy | 5 | Size-tiered to start | tentative |
+| Compaction strategy | 5 | size-tiered first, **leveled target** (read-heavy), pluggable | locked |
+| Tombstone GC safety | 5 | drop only at bottom-most level, else carry forward | locked |
+| File-set tracking | 5 | MANIFEST (append-only version edits) | locked |
+| Compaction concurrency | 5 | background thread, Arc'd Version, deferred file delete | locked |
 | Rust ↔ Go boundary | 10 | TBD | open |
 | Read consistency mode | 11 | Leader-only to start | tentative |
