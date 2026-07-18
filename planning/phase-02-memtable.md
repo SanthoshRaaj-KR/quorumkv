@@ -43,23 +43,29 @@ in *how* and in what they cost.
 | Hand-rolled skip list | O(log n) | Whatever you build | Educational but a rabbit hole; easy to get the concurrency subtly wrong. Not worth it here |
 | Balanced BST (AVL/red-black by hand) | O(log n) | Manual | BTreeMap *is* essentially this, done for you. No reason to hand-roll |
 
-### Why not skip list first (even though "real" engines use it)
+### Decision: `crossbeam-skiplist` — LOCKED
 
-The design doc name-drops skip list, and it's tempting to reach for the
-"production" answer. But the *only* reason production engines pick a skip list
-over a B-tree is **lock-free concurrent access** — many threads writing the
-memtable at once without a global lock. In Track A we are single-threaded. We
-have no concurrent writers to serve. So the skip list would buy us nothing we
-can use, while costing a dependency and more code to reason about.
+We're going with **`crossbeam-skiplist`** (a lock-free concurrent ordered map),
+the same class of structure RocksDB/LevelDB use. This is a deliberate choice to
+support **concurrent writers into the memtable** from the start, rather than a
+single-threaded `BTreeMap` we'd later have to replace.
 
-**Recommendation: `BTreeMap`, LOCKED for Phase 2.** Swap to `crossbeam-skiplist`
-*only if and when* a later phase introduces concurrent writers to the memtable
-(realistically not until you're optimizing, post-Phase 10). Record it as a
-known knob, don't pre-pay for it.
+Memtable type: `SkipMap<Vec<u8>, Value>`.
 
-> The general principle worth internalizing: pick the data structure your
-> *actual* access pattern needs, not the one the famous system uses under its
-> *different* access pattern.
+**Consequence to accept with eyes open:** concurrency doesn't stop at the
+memtable. The WAL from Phase 1 is a single append-only file with fsync-per-write.
+The moment multiple threads can write, they can also race on the WAL, so WAL
+`append` must be serialized (a mutex around append+fsync). That serialized fsync
+then becomes the write bottleneck — which is *exactly* the place group-commit
+(deferred in Phase 1) will eventually earn its keep. We don't build group-commit
+now; we just note that skip-list concurrency and WAL serialization are linked,
+and the fsync bottleneck is the signal to revisit it later (Phase 8/10, with a
+benchmark).
+
+> The tradeoff we're accepting: a dependency + epoch-based memory reclamation
+> complexity, in exchange for not rewriting the memtable when concurrency
+> arrives. (The alternative, `BTreeMap` + outer lock, is simpler but single-
+> writer; we chose the concurrent structure up front.)
 
 ---
 
@@ -101,7 +107,7 @@ enum Value {
 }
 ```
 
-The memtable is then `BTreeMap<Vec<u8>, Value>`. A `GET` that lands on
+The memtable is then `SkipMap<Vec<u8>, Value>`. A `GET` that lands on
 `Value::Delete` returns "not found." This one enum is the seed of the entire
 LSM read model — it reappears in SSTables, in the read merge order, and in
 compaction's "can I finally drop this tombstone?" logic.
@@ -110,30 +116,75 @@ compaction's "can I finally drop this tombstone?" logic.
 
 ## 4. Implementation approach
 
-The Phase 1 `Db` wrapper barely changes shape — we're swapping what it holds:
+The memtable is its own struct that bundles the map with its size counter —
+this bundling is what makes the freeze race-free (see below):
 
-- **State:** `BTreeMap<Vec<u8>, Value>` instead of `HashMap<Vec<u8>, Vec<u8>>`.
-- **`put(k, v)`:** `wal.append(Put, k, v)` → on Ok, `map.insert(k, Value::Put(v))`.
-- **`delete(k)`:** `wal.append(Delete, k, _)` → on Ok, `map.insert(k, Value::Delete)`.
-  Note: **insert a tombstone, don't remove.**
+```rust
+struct Memtable {
+    map:  SkipMap<Vec<u8>, Value>,
+    size: AtomicUsize,   // approximate bytes, owned by THIS memtable
+}
+```
+
+The Phase 1 `Db` wrapper holds one active `Memtable` and does:
+
+- **`put(k, v)`:** `wal.append(Put, k, v)` (under WAL lock) → on Ok,
+  `map.insert(k, Value::Put(v))` and `size.fetch_add(k.len()+v.len()+OVERHEAD)`.
+- **`delete(k)`:** `wal.append(Delete, k, _)` → on Ok,
+  `map.insert(k, Value::Delete)` and `size.fetch_add(k.len()+1+OVERHEAD)`.
+  Note: **insert a tombstone, don't remove.** A tombstone still occupies a slot,
+  so it still counts toward size.
 - **`get(k)`:** `match map.get(k)` → `Some(Put(v))` → found; `Some(Delete)` or
   `None` → not found.
-- **`replay()`:** unchanged from Phase 1 in spirit — read WAL records, but now
-  apply each into the `BTreeMap` as a `Put`/`Delete` marker instead of into a
-  HashMap. A `Delete` record replays as inserting a tombstone.
+- **`replay()`:** read WAL records, apply each into the `SkipMap` as a
+  `Put`/`Delete` marker. A `Delete` record replays as inserting a tombstone.
 
 The WAL record format from Phase 1 already distinguishes `op = PUT/DELETE`, so
 **no on-disk format change is needed** — we're only changing how a replayed
-DELETE is represented in memory (tombstone vs removal). That's a nice
-confirmation the Phase 1 format was right.
+DELETE is represented in memory (tombstone vs removal). Confirms the Phase 1
+format was right.
 
-### Size accounting (a small thing to add now)
+### Size accounting — the counter, done right
 
-The memtable needs to know *how big it is*, because Phase 3 flushes it when it
-crosses a size threshold. Start tracking approximate bytes now: on each insert,
-add `key.len() + value_size`; it's a running counter. Approximate is fine — it
-only triggers a flush, it's not a correctness number. Doing it now means Phase 3
-just reads `memtable.size()` instead of bolting on accounting later.
+The memtable must know how big it is so Phase 3 can flush at a threshold. The
+counter looks trivial but has three real subtleties that fall out of the
+concurrent skip list. The rules:
+
+1. **Owned, not shared/reset.** The `AtomicUsize` lives *inside* the `Memtable`
+   struct. We never reset a counter — freezing swaps in a *fresh* `Memtable`
+   whose counter is already 0. (Resetting a shared atomic while other threads
+   still add to it is a race; owning it sidesteps that entirely.)
+2. **Count bytes *written*, monotonic — not bytes *resident*.** Overwriting the
+   same key adds to the counter again even though the skip list holds one entry.
+   We do **not** try to decrement on overwrite — that adds races for no benefit,
+   and over-counting only makes us flush slightly *early*, which is harmless.
+   The threshold is approximate by design.
+3. **Include per-entry overhead.** `key.len()+value.len()` undercounts real RAM
+   — a skip-list node also has pointer towers, the enum tag, and allocation
+   overhead (tens of bytes). Add a fixed `OVERHEAD` constant per entry (say 64)
+   so "64MB counted" is a safe over-estimate of real memory, not an under-estimate.
+   For a DELETE, value is 0 bytes but still count `key.len()+1+OVERHEAD`.
+
+**Threshold is configurable, default 64MB.** Tests set it tiny (e.g. 1KB) to
+trigger a flush without writing 64MB. Phase 2 only exposes `approx_size()` and a
+`should_flush()` predicate (`size >= threshold`); the actual freeze happens in
+Phase 3.
+
+### The freeze — described here, implemented in Phase 3
+
+When a write pushes `size` past the threshold, the active memtable must become
+immutable and a fresh one take over. With concurrent writers this needs **exactly
+one winner**, or two threads both freeze and in-flight writes are lost:
+
+- Whoever's write crosses the threshold attempts to seal the active memtable —
+  via a `compare_exchange` on a "sealed" flag (or swapping the active-memtable
+  pointer under a short lock).
+- The single winner moves active → immutable list and installs a fresh
+  `Memtable` (counter 0). Every other thread sees "already sealed" and simply
+  writes into the new active memtable.
+
+Phase 2 builds the counter + predicate; Phase 3 builds this swap + the flush to
+SSTable. Keeping the boundary clean means Phase 2 stays purely in-memory.
 
 ---
 
@@ -168,21 +219,33 @@ just reads `memtable.size()` instead of bolting on accounting later.
    then GET → not found. Assert the two are distinguishable.
 6. **Overwrite / delete-then-reput** — the two edge cases above.
 
-Test 3 is the one worth the most — it's the difference between "passes Phase 2"
-and "sets up Phase 3 correctly."
+7. **Counter counts writes** — PUT the same key 3 times; assert the size
+   counter grew ~3× the entry size (monotonic, not deduplicated). Proves the
+   "bytes written, not resident" rule.
+8. **`should_flush()` fires** — set threshold tiny (e.g. 1KB), write until
+   `should_flush()` returns true, assert it flips at roughly the right byte count.
+9. **Concurrent writers, no lost updates** *(the skip-list payoff test)* —
+   spawn N threads each doing M distinct PUTs; join; assert all N×M keys are
+   present and the counter equals the expected total. Proves the concurrent
+   structure + atomic counter actually hold under contention.
+
+Test 3 sets up Phase 3 correctness; test 9 is the one that justifies choosing a
+concurrent skip list over a `BTreeMap` in the first place.
 
 ---
 
 ## 7. Decisions to lock before coding
 
-| Decision | Recommendation | Status |
+| Decision | Choice | Status |
 |---|---|---|
-| Memtable structure | `BTreeMap` (skip list only when concurrent writers exist) | recommend LOCK |
-| Delete representation | Tombstone (`Value::Delete`), never real removal | recommend LOCK |
-| Value model | `enum Value { Put(Vec<u8>), Delete }` | recommend LOCK |
-| Size accounting | Approximate running byte counter, added now | recommend LOCK |
+| Memtable structure | `crossbeam-skiplist` `SkipMap` (concurrent from the start) | LOCKED |
+| Delete representation | Tombstone (`Value::Delete`), never real removal | LOCKED |
+| Value model | `enum Value { Put(Vec<u8>), Delete }` | LOCKED |
+| Size counter | `AtomicUsize` **owned by** the `Memtable` struct | LOCKED |
+| Counting rule | bytes written (monotonic) + fixed per-entry `OVERHEAD`; tombstone counts `key+1+OVERHEAD` | LOCKED |
+| Flush threshold | configurable, default 64MB; tiny in tests | LOCKED |
+| Freeze safety | single winner via compare_exchange / pointer swap (impl in Phase 3) | LOCKED |
 
-Nothing here changes the WAL or its on-disk format — Phase 2 is a pure
-in-memory reshaping plus the tombstone concept. The tombstone decision is the
-one I'd most want your explicit buy-in on, because it's a small cost now that
-prevents a real headache in Phase 3.
+Consequence carried forward: concurrent writers mean the WAL append+fsync must
+be serialized (mutex), and that serialized fsync is the future group-commit
+trigger point (Phase 8/10). Noted, not built now.

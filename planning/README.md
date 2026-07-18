@@ -24,7 +24,7 @@ Every phase file has the same shape:
 | # | File | Concept | Status |
 |---|---|---|---|
 | 1 | [phase-01-wal.md](phase-01-wal.md) | Write-ahead log / durability | decisions locked |
-| 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | drafted |
+| 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | decisions locked |
 | 3 | phase-03-sstable.md | Flush to immutable disk file | todo |
 | 4 | phase-04-bloom.md | Skip files you don't need | todo |
 | 5 | phase-05-compaction.md | Storage-engine GC | todo |
@@ -46,7 +46,11 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | WAL framing | 1 | Length-prefix | locked |
 | WAL checksum | 1 | CRC32C per record | locked |
 | WAL durability | 1 | fsync per commit (group-commit later) | locked |
-| Memtable structure | 2 | BTreeMap to start | tentative |
+| Memtable structure | 2 | crossbeam-skiplist SkipMap | locked |
+| Delete representation | 2 | Tombstone (`Value::Delete`) | locked |
+| Size counter | 2 | AtomicUsize owned by Memtable; +OVERHEAD/entry | locked |
+| Flush threshold | 2 | 64MB, configurable | locked |
+| WAL serialization (consequence) | 2 | mutex around append+fsync; group-commit deferred | noted |
 | SSTable block/index format | 3 | TBD | open |
 | Bloom filter variant | 4 | TBD | open |
 | Compaction strategy | 5 | Size-tiered to start | tentative |
