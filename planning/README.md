@@ -27,7 +27,7 @@ Every phase file has the same shape:
 | 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | decisions locked |
 | 3 | [phase-03-sstable.md](phase-03-sstable.md) | Flush to immutable disk file | decisions locked |
 | 4 | [phase-04-bloom.md](phase-04-bloom.md) | Skip files you don't need | decisions locked |
-| 5 | phase-05-compaction.md | Storage-engine GC | todo |
+| 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | decisions locked |
 | 6 | phase-06-raft-single.md | Raft state machine, isolated | todo |
 | 7 | phase-07-election.md | Leader election over RPC | todo |
 | 8 | phase-08-replication.md | Agree on one ordered log | todo |
