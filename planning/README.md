@@ -26,7 +26,7 @@ Every phase file has the same shape:
 | 1 | [phase-01-wal.md](phase-01-wal.md) | Write-ahead log / durability | decisions locked |
 | 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | decisions locked |
 | 3 | [phase-03-sstable.md](phase-03-sstable.md) | Flush to immutable disk file | decisions locked |
-| 4 | phase-04-bloom.md | Skip files you don't need | todo |
+| 4 | [phase-04-bloom.md](phase-04-bloom.md) | Skip files you don't need | decisions locked |
 | 5 | phase-05-compaction.md | Storage-engine GC | todo |
 | 6 | phase-06-raft-single.md | Raft state machine, isolated | todo |
 | 7 | phase-07-election.md | Leader election over RPC | todo |
@@ -57,7 +57,11 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | File set tracking | 3 | monotonic file numbers + list-and-sort; MANIFEST → Phase 5 | locked |
 | WAL segmentation | 3 | per-memtable segment, deleted after SSTable durable | locked |
 | Flush timing | 3 | synchronous inline; background flush deferred | locked |
-| Bloom filter variant | 4 | TBD | open |
+| Bloom filter variant | 4 | Blocked Bloom (64-byte blocks), xxh3 | locked |
+| Bloom residency | 4 | RAM-resident when SSTable is live; never per-query disk read | locked |
+| Bloom tuning | 4 | ~10 bits/key (config), k≈6-7 | locked |
+| Bloom keys | 4 | every key incl. tombstones (no false negatives) | locked |
+| Bloom in file | 4 | new Bloom block + footer offset; CRC32C, rebuildable | locked |
 | Compaction strategy | 5 | Size-tiered to start | tentative |
 | Rust ↔ Go boundary | 10 | TBD | open |
 | Read consistency mode | 11 | Leader-only to start | tentative |
