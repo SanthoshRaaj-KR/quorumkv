@@ -21,7 +21,7 @@ fn main() -> std::io::Result<()> {
 
     // First session: a few writes, an overwrite, and a delete.
     {
-        let mut db = Db::open(&wal)?;
+        let db = Db::open(&wal)?;
         db.put(b"name", b"quorumkv")?;
         db.put(b"lang", b"rust")?;
         db.put(b"name", b"quorumkv-storage")?; // overwrite
@@ -46,6 +46,6 @@ fn main() -> std::io::Result<()> {
 }
 
 /// Render an optional value as a lossy string for display.
-fn show(v: Option<&[u8]>) -> Option<String> {
-    v.map(|b| String::from_utf8_lossy(b).into_owned())
+fn show(v: Option<Vec<u8>>) -> Option<String> {
+    v.map(|b| String::from_utf8_lossy(&b).into_owned())
 }
