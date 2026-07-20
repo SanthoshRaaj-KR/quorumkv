@@ -245,6 +245,49 @@ fn fsync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Task 3 — replay: durable file -> ordered records.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Read the WAL at `path` and return every complete record, in write order.
+///
+/// This is crash recovery. It walks the file record by record (using the
+/// `consumed` count from `decode_record`) and **stops cleanly at the first byte
+/// it cannot parse into a whole record** — a torn tail (`Incomplete`), a
+/// checksum failure (`CrcMismatch`), or mid-file corruption. Every such stop is
+/// expected, not an error: it marks where the log actually ended. This is
+/// exactly what makes "an unacknowledged write may be missing" *safe* — the
+/// half-written tail is dropped, and everything acknowledged before it survives
+/// (phase-01 §4, §5).
+///
+/// A missing file yields an empty log (a first run, before anything was
+/// written). Genuine I/O errors while reading an existing file are propagated.
+///
+/// Folding these records into current state (last-write-wins, DELETE removes) is
+/// the caller's job — the `Db` wrapper in Task 4.
+pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<Record>> {
+    let bytes = match std::fs::read(path.as_ref()) {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+
+    let mut records = Vec::new();
+    let mut pos = 0usize;
+    while pos < bytes.len() {
+        match decode_record(&bytes[pos..]) {
+            Ok((rec, consumed)) => {
+                records.push(rec);
+                pos += consumed;
+            }
+            // Torn tail or corruption: the durable log ends here. Stop cleanly
+            // and keep the valid prefix.
+            Err(_) => break,
+        }
+    }
+    Ok(records)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -477,5 +520,115 @@ mod tests {
         // A bare filename has no directory component; we fsync "." instead.
         assert_eq!(parent_dir(Path::new("bare.log")), Path::new("."));
         assert_eq!(parent_dir(Path::new("sub/wal.log")), Path::new("sub"));
+    }
+
+    // ── Task 3: replay ───────────────────────────────────────────────────────
+
+    /// Append raw bytes to a file (used to inject torn/partial tails a normal
+    /// `WalWriter` would never produce).
+    fn append_raw(path: &Path, bytes: &[u8]) {
+        use std::io::Write;
+        let mut f = OpenOptions::new().append(true).open(path).unwrap();
+        f.write_all(bytes).unwrap();
+        f.sync_all().unwrap();
+    }
+
+    #[test]
+    fn replay_of_absent_file_is_empty() {
+        let dir = TempDir::new();
+        // Never created.
+        let recs = replay(dir.path("nope.log")).unwrap();
+        assert!(recs.is_empty());
+    }
+
+    #[test]
+    fn replay_of_empty_file_is_empty() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        let _w = WalWriter::open(&path).unwrap(); // creates a 0-byte file
+        assert!(replay(&path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn replay_recovers_all_records_in_order() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        let written = vec![put(b"a", b"1"), put(b"b", b"2"), del(b"a"), put(b"c", b"3")];
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            for r in &written {
+                w.append(r).unwrap();
+            }
+        }
+        assert_eq!(replay(&path).unwrap(), written);
+    }
+
+    #[test]
+    fn replay_recovers_100_keys() {
+        // The headline done-when, at the record-sequence level (the crash is
+        // simulated for real in Task 6).
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            for i in 0..100u32 {
+                w.append(&put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes())).unwrap();
+            }
+        }
+        let recs = replay(&path).unwrap();
+        assert_eq!(recs.len(), 100);
+        assert_eq!(recs[42], put(b"k42", b"v42"));
+    }
+
+    #[test]
+    fn replay_stops_at_a_torn_tail() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            w.append(&put(b"one", b"1")).unwrap();
+            w.append(&put(b"two", b"2")).unwrap();
+        }
+        // Simulate a crash mid-write: a header plus only half a payload.
+        let partial = encode_record(&put(b"three", b"3"));
+        let half = partial.len() - 2;
+        append_raw(&path, &partial[..half]);
+
+        // Exactly the two acknowledged records come back; no panic on the tail.
+        assert_eq!(replay(&path).unwrap(), vec![put(b"one", b"1"), put(b"two", b"2")]);
+    }
+
+    #[test]
+    fn replay_stops_at_a_stray_partial_header() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            w.append(&put(b"one", b"1")).unwrap();
+        }
+        append_raw(&path, &[0xDE, 0xAD, 0xBE]); // 3 bytes, less than a header
+        assert_eq!(replay(&path).unwrap(), vec![put(b"one", b"1")]);
+    }
+
+    #[test]
+    fn replay_keeps_prefix_before_mid_file_corruption() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            w.append(&put(b"one", b"1")).unwrap();
+            w.append(&put(b"two", b"2")).unwrap();
+            w.append(&put(b"three", b"3")).unwrap();
+        }
+        // Corrupt one byte inside the *second* record, then rewrite the file.
+        let len0 = encode_record(&put(b"one", b"1")).len();
+        let len1 = encode_record(&put(b"two", b"2")).len();
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[len0 + len1 - 1] ^= 0xFF; // last byte of record #2
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Only the clean prefix (record #1) survives; #2 fails CRC and #3 is
+        // unreachable behind it.
+        assert_eq!(replay(&path).unwrap(), vec![put(b"one", b"1")]);
     }
 }
