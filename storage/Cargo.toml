@@ -16,6 +16,10 @@ crc32c = "0.6"
 # unlike env_logger/tracing-subscriber). Our own tiny backend lives in `logger`.
 log = "0.4"
 
+# Phase 2: lock-free concurrent ordered map for the memtable (same class RocksDB
+# uses). LOCKED in planning/phase-02-memtable.md §2.
+crossbeam-skiplist = "0.1"
+
 # No dev-dependencies: tests use a small std-only temp-dir helper (see tests/).
 # Rationale: the windows-gnu toolchain on this machine has no external mingw, so
 # crates using `raw-dylib` system imports (tempfile -> windows-sys) can't link.
