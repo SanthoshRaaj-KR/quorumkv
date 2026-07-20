@@ -1,62 +1,65 @@
-//! The `Db` wrapper (Phase 1, Task 4) — see `planning/phase-01-wal.md` §4.
+//! The `Db` wrapper — the storage engine's public API.
 //!
-//! A thin key-value store: an in-memory `HashMap` fronted by the WAL. It exists
-//! to enforce the one invariant the whole engine leans on:
+//! Phase 1 backed this with a `HashMap`; Phase 2 swaps in the sorted, concurrent
+//! [`Memtable`] and represents deletes as tombstones. The durability invariant is
+//! unchanged: **the WAL is made durable before in-memory state changes.**
 //!
-//! > **The WAL is made durable *before* in-memory state changes.** `put`/`delete`
-//! > call `WalWriter::append` first and mutate the map only after it returns
-//! > `Ok`. So a crash can lose an unacknowledged write, but never leave the map
-//! > showing a write the log doesn't have.
+//! ## Concurrency (Phase 2)
 //!
-//! `Db` is deliberately the seam the memtable replaces in Phase 2: the map is
-//! the "live layer", and everything routes through `open`/`put`/`get`/`delete`.
+//! `put`/`delete`/`get` all take `&self`, so a `Db` can be shared across threads
+//! (e.g. `Arc<Db>`). Reads are lock-free (the skip list). Writes take a `Mutex`
+//! around the WAL so append+fsync is serialized — the single choke point the
+//! planning doc flags as the future group-commit site.
+//!
+//! We hold that WAL lock **across the memtable insert**, not just the append.
+//! That keeps the memtable's per-key order identical to the WAL's, so replaying
+//! the WAL reconstructs exactly the live memtable — even when two threads write
+//! the same key. (Readers still run lock-free throughout.)
 
-use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io;
 use std::path::Path;
+use std::sync::Mutex;
 
+use crate::memtable::{Memtable, Value, DEFAULT_THRESHOLD};
 use crate::wal::{recover, Record, WalWriter};
 
-/// A durable key-value store backed by a single write-ahead log.
+/// A durable, concurrent key-value store backed by a single write-ahead log.
 pub struct Db {
-    /// The live in-memory state. Rebuilt from the WAL on `open`.
-    map: HashMap<Vec<u8>, Vec<u8>>,
-    /// The append-only, fsync-per-write log in front of `map`.
-    wal: WalWriter,
+    mem: Memtable,
+    wal: Mutex<WalWriter>,
 }
 
 impl Db {
-    /// Open the store at `path`, rebuilding in-memory state by replaying the WAL.
-    ///
-    /// Recovery is three steps:
-    /// 1. `recover` the durable records and the offset where the valid log ends.
-    /// 2. Fold the records into the map (last write wins; DELETE removes).
-    /// 3. **Truncate any torn/corrupt tail** back to that valid offset before we
-    ///    start appending. Without step 3, a crash-torn tail would sit in the
-    ///    middle of the file; new appends would land *after* it, and the next
-    ///    replay would stop at the tail and silently lose them.
+    /// Open the store at `path` with the default flush threshold (64 MB).
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_threshold(path, DEFAULT_THRESHOLD)
+    }
+
+    /// Open the store with an explicit memtable flush threshold (tests use a tiny
+    /// value; the flush itself is Phase 3).
+    ///
+    /// Recovery: [`recover`] the durable records and the valid-log offset, fold
+    /// the records into the memtable (DELETE → tombstone), truncate any torn tail
+    /// back to the valid offset, then open the WAL for appending.
+    pub fn open_with_threshold(path: impl AsRef<Path>, threshold: usize) -> io::Result<Self> {
         let path = path.as_ref();
         log::info!(target: "db", "opening {}", path.display());
 
         let (records, valid_len) = recover(path)?;
         let replayed = records.len();
 
-        let mut map = HashMap::new();
+        let mem = Memtable::with_threshold(threshold);
         for rec in records {
             match rec {
-                Record::Put { key, value } => {
-                    map.insert(key, value);
-                }
-                Record::Delete { key } => {
-                    map.remove(&key);
-                }
+                Record::Put { key, value } => mem.put(&key, &value),
+                Record::Delete { key } => mem.delete(&key),
             }
         }
 
         // Heal a torn/corrupt tail so the append point is right after the last
-        // durable record. Only touches the file when there is trailing garbage.
+        // durable record (otherwise later appends would be shadowed on the next
+        // replay). Only touches the file when there is trailing garbage.
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() > valid_len {
                 log::warn!(
@@ -75,55 +78,65 @@ impl Db {
         let wal = WalWriter::open(path)?;
         log::info!(
             target: "db",
-            "open complete: replayed {replayed} record(s) -> {} live key(s)",
-            map.len(),
+            "open complete: replayed {replayed} record(s) -> {} memtable entr(y|ies)",
+            mem.len(),
         );
-        Ok(Db { map, wal })
+        Ok(Db { mem, wal: Mutex::new(wal) })
     }
 
     /// Durably record `key -> value`, then update memory. WAL first, always.
-    pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
+    pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
         let rec = Record::Put { key: key.to_vec(), value: value.to_vec() };
-        self.wal.append(&rec)?; // durable first
+        // Hold the WAL lock across the memtable insert (see module docs).
+        let mut wal = self.wal.lock().expect("WAL mutex poisoned");
+        wal.append(&rec)?; // durable first
+        self.mem.put(key, value);
         log::trace!(
             target: "db",
             "put {:?} ({} value byte(s))",
             String::from_utf8_lossy(key),
             value.len(),
         );
-        if let Record::Put { key, value } = rec {
-            // Reuse the buffers we just built rather than cloning again.
-            self.map.insert(key, value);
-        }
         Ok(())
     }
 
-    /// Durably record a delete, then remove from memory. WAL first, always.
+    /// Durably record a delete (as a tombstone), then apply it to memory.
     ///
-    /// Deleting an absent key is legal — it is still logged (a no-op on the map).
-    pub fn delete(&mut self, key: &[u8]) -> io::Result<()> {
+    /// Deleting an absent key is legal — it is still logged and inserts a
+    /// tombstone (a no-op on the live view, but it shadows any older on-disk copy
+    /// once SSTables exist in Phase 3).
+    pub fn delete(&self, key: &[u8]) -> io::Result<()> {
         let rec = Record::Delete { key: key.to_vec() };
-        self.wal.append(&rec)?; // durable first
+        let mut wal = self.wal.lock().expect("WAL mutex poisoned");
+        wal.append(&rec)?; // durable first
+        self.mem.delete(key);
         log::trace!(target: "db", "delete {:?}", String::from_utf8_lossy(key));
-        if let Record::Delete { key } = rec {
-            self.map.remove(&key);
-        }
         Ok(())
     }
 
-    /// Look up a key. Reads never touch the WAL.
-    pub fn get(&self, key: &[u8]) -> Option<&[u8]> {
-        self.map.get(key).map(Vec::as_slice)
+    /// Look up a key's live value. A deleted key (tombstone) reads as not-found.
+    pub fn get(&self, key: &[u8]) -> Option<Vec<u8>> {
+        self.mem.get(key)
     }
 
-    /// Number of live keys.
+    /// Number of **live** keys (tombstones excluded). O(n) introspection helper.
     pub fn len(&self) -> usize {
-        self.map.len()
+        self.mem.iter().filter(|(_, v)| matches!(v, Value::Put(_))).count()
     }
 
     /// Whether the store holds no live keys.
     pub fn is_empty(&self) -> bool {
-        self.map.is_empty()
+        !self.mem.iter().any(|(_, v)| matches!(v, Value::Put(_)))
+    }
+
+    /// Approximate bytes written into the active memtable (monotonic).
+    pub fn approx_size(&self) -> usize {
+        self.mem.approx_size()
+    }
+
+    /// Whether the memtable has grown past its flush threshold (Phase 3 acts on it).
+    pub fn should_flush(&self) -> bool {
+        self.mem.should_flush()
     }
 }
 
@@ -136,9 +149,9 @@ mod tests {
     #[test]
     fn put_then_get() {
         let dir = TempDir::new();
-        let mut db = Db::open(dir.path("wal.log")).unwrap();
+        let db = Db::open(dir.path("wal.log")).unwrap();
         db.put(b"k", b"v").unwrap();
-        assert_eq!(db.get(b"k"), Some(b"v".as_slice()));
+        assert_eq!(db.get(b"k"), Some(b"v".to_vec()));
     }
 
     #[test]
@@ -151,26 +164,28 @@ mod tests {
     #[test]
     fn overwrite_last_write_wins() {
         let dir = TempDir::new();
-        let mut db = Db::open(dir.path("wal.log")).unwrap();
+        let db = Db::open(dir.path("wal.log")).unwrap();
         db.put(b"k", b"1").unwrap();
         db.put(b"k", b"2").unwrap();
-        assert_eq!(db.get(b"k"), Some(b"2".as_slice()));
+        assert_eq!(db.get(b"k"), Some(b"2".to_vec()));
         assert_eq!(db.len(), 1);
     }
 
     #[test]
-    fn delete_removes_key() {
+    fn delete_removes_key_from_live_view() {
         let dir = TempDir::new();
-        let mut db = Db::open(dir.path("wal.log")).unwrap();
+        let db = Db::open(dir.path("wal.log")).unwrap();
         db.put(b"k", b"v").unwrap();
         db.delete(b"k").unwrap();
         assert_eq!(db.get(b"k"), None);
+        assert_eq!(db.len(), 0); // no live keys...
+        assert!(!db.mem.is_empty()); // ...but the tombstone is still resident
     }
 
     #[test]
     fn delete_of_absent_key_is_ok() {
         let dir = TempDir::new();
-        let mut db = Db::open(dir.path("wal.log")).unwrap();
+        let db = Db::open(dir.path("wal.log")).unwrap();
         db.delete(b"never-existed").unwrap();
         assert_eq!(db.get(b"never-existed"), None);
     }
@@ -178,9 +193,9 @@ mod tests {
     #[test]
     fn empty_value_is_distinct_from_absent() {
         let dir = TempDir::new();
-        let mut db = Db::open(dir.path("wal.log")).unwrap();
+        let db = Db::open(dir.path("wal.log")).unwrap();
         db.put(b"k", b"").unwrap();
-        assert_eq!(db.get(b"k"), Some(b"".as_slice())); // present, empty
+        assert_eq!(db.get(b"k"), Some(Vec::new())); // present, empty
         assert_eq!(db.get(b"other"), None); // absent
     }
 
@@ -189,61 +204,84 @@ mod tests {
         let dir = TempDir::new();
         let path = dir.path("wal.log");
         {
-            let mut db = Db::open(&path).unwrap();
+            let db = Db::open(&path).unwrap();
             for i in 0..100u32 {
                 db.put(format!("k{i}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
             }
-        } // drop -> close
+        }
         let db = Db::open(&path).unwrap();
         assert_eq!(db.len(), 100);
-        assert_eq!(db.get(b"k42"), Some(b"v42".as_slice()));
+        assert_eq!(db.get(b"k42"), Some(b"v42".to_vec()));
     }
 
     #[test]
-    fn overwrite_and_delete_survive_reopen() {
+    fn tombstone_survives_reopen() {
+        // Crash-rebuild with a delete: after replay, the deleted key must still
+        // read not-found (the DELETE record replays as a tombstone).
         let dir = TempDir::new();
         let path = dir.path("wal.log");
         {
-            let mut db = Db::open(&path).unwrap();
+            let db = Db::open(&path).unwrap();
             db.put(b"a", b"1").unwrap();
             db.put(b"a", b"2").unwrap(); // overwrite
             db.put(b"b", b"1").unwrap();
             db.delete(b"b").unwrap(); // tombstone
         }
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.get(b"a"), Some(b"2".as_slice())); // last write won
+        assert_eq!(db.get(b"a"), Some(b"2".to_vec())); // last write won
         assert_eq!(db.get(b"b"), None); // delete replayed
         assert_eq!(db.len(), 1);
     }
 
     #[test]
-    fn torn_tail_is_healed_so_later_writes_are_not_shadowed() {
-        // The headline correctness case for `open`'s tail-healing: a crash left a
-        // torn record; on reopen we must truncate it, so a write made *after*
-        // recovery still survives the *next* reopen.
+    fn delete_then_reput_survives_reopen() {
         let dir = TempDir::new();
         let path = dir.path("wal.log");
         {
-            let mut db = Db::open(&path).unwrap();
+            let db = Db::open(&path).unwrap();
+            db.delete(b"k").unwrap();
+            db.put(b"k", b"back").unwrap(); // resurrect after tombstone
+        }
+        let db = Db::open(&path).unwrap();
+        assert_eq!(db.get(b"k"), Some(b"back".to_vec()));
+        assert_eq!(db.len(), 1);
+    }
+
+    #[test]
+    fn torn_tail_is_healed_so_later_writes_are_not_shadowed() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        {
+            let db = Db::open(&path).unwrap();
             db.put(b"before", b"crash").unwrap();
         }
         // Inject a half-written record, as a crash mid-append would.
         let partial = encode_record(&Record::Put { key: b"torn".to_vec(), value: b"x".to_vec() });
         append_raw(&path, &partial[..partial.len() - 2]);
 
-        // Reopen (heals the tail), then append a new record.
         {
-            let mut db = Db::open(&path).unwrap();
-            assert_eq!(db.get(b"before"), Some(b"crash".as_slice()));
-            assert_eq!(db.get(b"torn"), None); // torn write dropped
+            let db = Db::open(&path).unwrap(); // heals the tail
+            assert_eq!(db.get(b"before"), Some(b"crash".to_vec()));
+            assert_eq!(db.get(b"torn"), None);
             db.put(b"after", b"recovery").unwrap();
         }
 
-        // The post-recovery write must survive because the tail was truncated,
-        // not left to stop the next replay early.
         let db = Db::open(&path).unwrap();
-        assert_eq!(db.get(b"before"), Some(b"crash".as_slice()));
-        assert_eq!(db.get(b"after"), Some(b"recovery".as_slice()));
+        assert_eq!(db.get(b"before"), Some(b"crash".to_vec()));
+        assert_eq!(db.get(b"after"), Some(b"recovery".to_vec()));
         assert_eq!(db.get(b"torn"), None);
+    }
+
+    #[test]
+    fn should_flush_passthrough() {
+        let dir = TempDir::new();
+        let db = Db::open_with_threshold(dir.path("wal.log"), 512).unwrap();
+        assert!(!db.should_flush());
+        let mut i = 0;
+        while !db.should_flush() {
+            db.put(format!("k{i:06}").as_bytes(), b"value").unwrap();
+            i += 1;
+        }
+        assert!(db.approx_size() >= 512);
     }
 }
