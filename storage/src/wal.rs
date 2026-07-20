@@ -27,6 +27,10 @@
 //! single key or value is capped at 4 GiB (phase-01 §5 — documented, not a
 //! concern for Track A).
 
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::path::{Path, PathBuf};
+
 const OP_PUT: u8 = 0x01;
 const OP_DELETE: u8 = 0x02;
 
@@ -160,6 +164,87 @@ fn read_bytes<'a>(buf: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], 
     Ok(slice)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Task 2 — the writer: framed bytes -> durable file.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Append-only, `fsync`-per-write handle onto a WAL file.
+///
+/// This struct is where the whole engine's core promise is created: **when
+/// `append` returns `Ok`, the record has been flushed to stable storage.** The
+/// caller (the `Db` wrapper in Task 4) must update in-memory state *only after*
+/// `append` returns `Ok` — never before. If `append` returns `Err`, the write
+/// was not durable and must not be treated as acknowledged (phase-01 §4).
+pub struct WalWriter {
+    file: File,
+    #[allow(dead_code)] // used by later phases (segment discard); kept for clarity now.
+    path: PathBuf,
+}
+
+impl WalWriter {
+    /// Open (creating if absent) `path` for appending.
+    ///
+    /// On first creation we also `fsync` the containing directory so the file's
+    /// *existence* is durable, not just its contents (phase-01 §2c). Reopening an
+    /// existing WAL appends to it — it is never truncated.
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let existed = path.exists();
+
+        // `append(true)` makes every write go to the current end of file, so a
+        // reopen continues the log rather than overwriting it. `File` is
+        // unbuffered — `write_all` issues the `write` syscall directly, so there
+        // is no in-process buffer to flush before `fsync`.
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+
+        if !existed {
+            fsync_dir(parent_dir(&path))?;
+        }
+        Ok(Self { file, path })
+    }
+
+    /// Encode `rec`, append it, and make it durable before returning.
+    ///
+    /// Order (phase-01 §4): encode → `write_all` (into the OS page cache) →
+    /// `fsync` (page cache → stable storage). Any error is propagated so the
+    /// caller does not acknowledge a non-durable write.
+    pub fn append(&mut self, rec: &Record) -> io::Result<()> {
+        let bytes = encode_record(rec);
+        self.file.write_all(&bytes)?;
+        // `sync_all` == `fsync`: flushes data *and* file metadata. Phase-01 §2c
+        // locks fsync-per-append for now; `sync_data` (fdatasync) is the noted
+        // future optimization once the file size is stable.
+        self.file.sync_all()?;
+        Ok(())
+    }
+}
+
+/// The directory to fsync for a WAL path, treating a bare filename as `.`.
+fn parent_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    }
+}
+
+/// `fsync` a directory so a newly-created file's directory entry is durable.
+///
+/// This is a Unix concern; on Unix we open the directory and `sync_all` its
+/// handle. Windows' std cannot fsync a directory handle, and NTFS makes the
+/// directory entry durable through different means, so it is a no-op there
+/// (phase-01 §2c). Note this only affects *power-loss* durability of the file's
+/// existence — it is irrelevant to the `kill -9` done-when, which the OS page
+/// cache already survives.
+#[cfg(unix)]
+fn fsync_dir(dir: &Path) -> io::Result<()> {
+    File::open(dir)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn fsync_dir(_dir: &Path) -> io::Result<()> {
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +254,42 @@ mod tests {
     }
     fn del(k: &[u8]) -> Record {
         Record::Delete { key: k.to_vec() }
+    }
+
+    // ── std-only temp dir (we intentionally have no `tempfile` dep) ──────────
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A unique temp directory removed when dropped. Enough for tests; not a
+    /// general-purpose tempfile replacement.
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let mut p = std::env::temp_dir();
+            p.push(format!("quorumkv-wal-{}-{}", std::process::id(), n));
+            std::fs::create_dir_all(&p).unwrap();
+            TempDir(p)
+        }
+        fn path(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Decode every record in a raw byte buffer by walking `consumed`, stopping
+    /// at the first non-record. Lets a test assert what actually landed on disk.
+    fn decode_all(mut buf: &[u8]) -> Vec<Record> {
+        let mut out = Vec::new();
+        while let Ok((rec, n)) = decode_record(buf) {
+            out.push(rec);
+            buf = &buf[n..];
+        }
+        out
     }
 
     #[test]
@@ -287,5 +408,74 @@ mod tests {
         let (decoded, consumed) = decode_record(&bytes).unwrap();
         assert_eq!(decoded, put(b"k", b"v"));
         assert_eq!(consumed, real_len);
+    }
+
+    // ── Task 2: WalWriter ────────────────────────────────────────────────────
+
+    #[test]
+    fn open_creates_the_file() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        assert!(!path.exists());
+        let _w = WalWriter::open(&path).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn appended_records_land_on_disk_in_order() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        let mut w = WalWriter::open(&path).unwrap();
+        w.append(&put(b"a", b"1")).unwrap();
+        w.append(&put(b"b", b"2")).unwrap();
+        w.append(&del(b"a")).unwrap();
+
+        // Read the raw file back (the writer is still open) and decode it.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(decode_all(&bytes), vec![put(b"a", b"1"), put(b"b", b"2"), del(b"a")]);
+    }
+
+    #[test]
+    fn append_is_synchronously_visible() {
+        // After `append` returns Ok, the bytes are readable by a fresh reader
+        // without closing the writer — the write reached (at least) the OS, which
+        // is what durability-on-return requires.
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        let mut w = WalWriter::open(&path).unwrap();
+        w.append(&put(b"k", b"v")).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(decode_all(&bytes), vec![put(b"k", b"v")]);
+    }
+
+    #[test]
+    fn reopen_appends_rather_than_truncates() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            w.append(&put(b"first", b"1")).unwrap();
+        } // writer dropped -> file closed
+        {
+            let mut w = WalWriter::open(&path).unwrap();
+            w.append(&put(b"second", b"2")).unwrap();
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(decode_all(&bytes), vec![put(b"first", b"1"), put(b"second", b"2")]);
+    }
+
+    #[test]
+    fn fresh_wal_file_is_empty() {
+        let dir = TempDir::new();
+        let path = dir.path("wal.log");
+        let _w = WalWriter::open(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn parent_dir_falls_back_to_current_dir() {
+        // A bare filename has no directory component; we fsync "." instead.
+        assert_eq!(parent_dir(Path::new("bare.log")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("sub/wal.log")), Path::new("sub"));
     }
 }
