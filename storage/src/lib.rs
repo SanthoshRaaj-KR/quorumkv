@@ -11,6 +11,7 @@
 
 pub mod db;
 pub mod logger;
+pub mod memtable;
 pub mod wal;
 
 #[cfg(test)]
