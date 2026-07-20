@@ -249,26 +249,26 @@ fn fsync_dir(_dir: &Path) -> io::Result<()> {
 // Task 3 — replay: durable file -> ordered records.
 // ────────────────────────────────────────────────────────────────────────────
 
-/// Read the WAL at `path` and return every complete record, in write order.
+/// Crash recovery: read the WAL at `path`, returning every complete record in
+/// write order **and the byte offset where the valid log ends**.
 ///
-/// This is crash recovery. It walks the file record by record (using the
-/// `consumed` count from `decode_record`) and **stops cleanly at the first byte
-/// it cannot parse into a whole record** — a torn tail (`Incomplete`), a
-/// checksum failure (`CrcMismatch`), or mid-file corruption. Every such stop is
-/// expected, not an error: it marks where the log actually ended. This is
-/// exactly what makes "an unacknowledged write may be missing" *safe* — the
-/// half-written tail is dropped, and everything acknowledged before it survives
-/// (phase-01 §4, §5).
+/// It walks the file record by record (using the `consumed` count from
+/// `decode_record`) and **stops cleanly at the first byte it cannot parse into a
+/// whole record** — a torn tail (`Incomplete`), a checksum failure
+/// (`CrcMismatch`), or mid-file corruption. Every such stop is expected, not an
+/// error: it marks where the log actually ended. This is exactly what makes "an
+/// unacknowledged write may be missing" *safe* — the half-written tail is
+/// dropped, and everything acknowledged before it survives (phase-01 §4, §5).
 ///
-/// A missing file yields an empty log (a first run, before anything was
-/// written). Genuine I/O errors while reading an existing file are propagated.
+/// The returned offset is what `Db::open` truncates the file to before it starts
+/// appending again, so a crash-torn tail can't shadow later writes.
 ///
-/// Folding these records into current state (last-write-wins, DELETE removes) is
-/// the caller's job — the `Db` wrapper in Task 4.
-pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<Record>> {
+/// A missing file yields an empty log at offset 0 (a first run). Genuine I/O
+/// errors while reading an existing file are propagated.
+pub fn recover(path: impl AsRef<Path>) -> io::Result<(Vec<Record>, u64)> {
     let bytes = match std::fs::read(path.as_ref()) {
         Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((Vec::new(), 0)),
         Err(e) => return Err(e),
     };
 
@@ -280,12 +280,18 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<Record>> {
                 records.push(rec);
                 pos += consumed;
             }
-            // Torn tail or corruption: the durable log ends here. Stop cleanly
-            // and keep the valid prefix.
+            // Torn tail or corruption: the durable log ends here. Stop cleanly;
+            // `pos` now marks the end of the valid prefix.
             Err(_) => break,
         }
     }
-    Ok(records)
+    Ok((records, pos as u64))
+}
+
+/// Convenience over [`recover`] for callers that only need the records (e.g.
+/// tests). Folding these into current state is the `Db` wrapper's job.
+pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<Record>> {
+    Ok(recover(path)?.0)
 }
 
 #[cfg(test)]
@@ -299,30 +305,7 @@ mod tests {
         Record::Delete { key: k.to_vec() }
     }
 
-    // ── std-only temp dir (we intentionally have no `tempfile` dep) ──────────
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    /// A unique temp directory removed when dropped. Enough for tests; not a
-    /// general-purpose tempfile replacement.
-    struct TempDir(PathBuf);
-    impl TempDir {
-        fn new() -> Self {
-            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let mut p = std::env::temp_dir();
-            p.push(format!("quorumkv-wal-{}-{}", std::process::id(), n));
-            std::fs::create_dir_all(&p).unwrap();
-            TempDir(p)
-        }
-        fn path(&self, name: &str) -> PathBuf {
-            self.0.join(name)
-        }
-    }
-    impl Drop for TempDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::testutil::{append_raw, TempDir};
 
     /// Decode every record in a raw byte buffer by walking `consumed`, stopping
     /// at the first non-record. Lets a test assert what actually landed on disk.
@@ -523,15 +506,6 @@ mod tests {
     }
 
     // ── Task 3: replay ───────────────────────────────────────────────────────
-
-    /// Append raw bytes to a file (used to inject torn/partial tails a normal
-    /// `WalWriter` would never produce).
-    fn append_raw(path: &Path, bytes: &[u8]) {
-        use std::io::Write;
-        let mut f = OpenOptions::new().append(true).open(path).unwrap();
-        f.write_all(bytes).unwrap();
-        f.sync_all().unwrap();
-    }
 
     #[test]
     fn replay_of_absent_file_is_empty() {
