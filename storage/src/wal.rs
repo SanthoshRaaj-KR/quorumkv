@@ -9,7 +9,7 @@
 //! ```text
 //! ┌──────────┬──────────┬─────────┬──────────┬─────────┬──────────┐
 //! │ crc32c   │ length   │ op      │ key       │ vlen     │ value    │
-//! │ 4 bytes  │ 4 bytes  │ 1 byte  │ klen+key  │ 4 bytes  │ vlen     │
+//! │ 4 bytes  │ 4 bytes  │ 1 byte  │ klen+key  │ 4 bytes  │      │
 //! └──────────┴──────────┴─────────┴──────────┴─────────┴──────────┘
 //!   └── crc covers everything to its right: [length .. end] ──┘
 //! ```
