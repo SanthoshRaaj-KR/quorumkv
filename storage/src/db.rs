@@ -38,8 +38,10 @@ impl Db {
     ///    replay would stop at the tail and silently lose them.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref();
+        log::info!(target: "db", "opening {}", path.display());
 
         let (records, valid_len) = recover(path)?;
+        let replayed = records.len();
 
         let mut map = HashMap::new();
         for rec in records {
@@ -57,6 +59,13 @@ impl Db {
         // durable record. Only touches the file when there is trailing garbage.
         if let Ok(meta) = std::fs::metadata(path) {
             if meta.len() > valid_len {
+                log::warn!(
+                    target: "db",
+                    "healing torn tail: truncating {} from {} to {} bytes",
+                    path.display(),
+                    meta.len(),
+                    valid_len,
+                );
                 let f = OpenOptions::new().write(true).open(path)?;
                 f.set_len(valid_len)?;
                 f.sync_all()?;
@@ -64,6 +73,11 @@ impl Db {
         }
 
         let wal = WalWriter::open(path)?;
+        log::info!(
+            target: "db",
+            "open complete: replayed {replayed} record(s) -> {} live key(s)",
+            map.len(),
+        );
         Ok(Db { map, wal })
     }
 
@@ -71,6 +85,12 @@ impl Db {
     pub fn put(&mut self, key: &[u8], value: &[u8]) -> io::Result<()> {
         let rec = Record::Put { key: key.to_vec(), value: value.to_vec() };
         self.wal.append(&rec)?; // durable first
+        log::trace!(
+            target: "db",
+            "put {:?} ({} value byte(s))",
+            String::from_utf8_lossy(key),
+            value.len(),
+        );
         if let Record::Put { key, value } = rec {
             // Reuse the buffers we just built rather than cloning again.
             self.map.insert(key, value);
@@ -84,6 +104,7 @@ impl Db {
     pub fn delete(&mut self, key: &[u8]) -> io::Result<()> {
         let rec = Record::Delete { key: key.to_vec() };
         self.wal.append(&rec)?; // durable first
+        log::trace!(target: "db", "delete {:?}", String::from_utf8_lossy(key));
         if let Record::Delete { key } = rec {
             self.map.remove(&key);
         }

@@ -199,6 +199,9 @@ impl WalWriter {
 
         if !existed {
             fsync_dir(parent_dir(&path))?;
+            log::debug!(target: "wal", "created {} (dir fsynced)", path.display());
+        } else {
+            log::debug!(target: "wal", "opened existing {}", path.display());
         }
         Ok(Self { file, path })
     }
@@ -215,6 +218,7 @@ impl WalWriter {
         // locks fsync-per-append for now; `sync_data` (fdatasync) is the noted
         // future optimization once the file size is stable.
         self.file.sync_all()?;
+        log::trace!(target: "wal", "appended + fsynced {} bytes", bytes.len());
         Ok(())
     }
 }
@@ -272,6 +276,7 @@ pub fn recover(path: impl AsRef<Path>) -> io::Result<(Vec<Record>, u64)> {
         Err(e) => return Err(e),
     };
 
+    let total = bytes.len();
     let mut records = Vec::new();
     let mut pos = 0usize;
     while pos < bytes.len() {
@@ -282,8 +287,19 @@ pub fn recover(path: impl AsRef<Path>) -> io::Result<(Vec<Record>, u64)> {
             }
             // Torn tail or corruption: the durable log ends here. Stop cleanly;
             // `pos` now marks the end of the valid prefix.
-            Err(_) => break,
+            Err(reason) => {
+                log::warn!(
+                    target: "wal",
+                    "recover: stopping at offset {pos}/{total} ({reason:?}); dropping {} trailing byte(s), {} record(s) recovered",
+                    total - pos,
+                    records.len(),
+                );
+                break;
+            }
         }
+    }
+    if pos == total {
+        log::debug!(target: "wal", "recover: clean, {} record(s) over {total} bytes", records.len());
     }
     Ok((records, pos as u64))
 }
