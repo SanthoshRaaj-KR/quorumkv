@@ -53,7 +53,7 @@ fn acknowledged_writes_survive_kill9() {
     for key in &acked {
         assert_eq!(
             db.get(key.as_bytes()),
-            Some(key.as_bytes()),
+            Some(key.as_bytes().to_vec()),
             "acknowledged key {key} was lost across the crash",
         );
     }

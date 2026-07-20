@@ -18,7 +18,7 @@ fn main() {
         .nth(1)
         .expect("usage: wal_crash_writer <wal-path>");
 
-    let mut db = Db::open(&path).expect("open db");
+    let db = Db::open(&path).expect("open db");
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
