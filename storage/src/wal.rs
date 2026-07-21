@@ -223,8 +223,8 @@ impl WalWriter {
     }
 }
 
-/// The directory to fsync for a WAL path, treating a bare filename as `.`.
-fn parent_dir(path: &Path) -> &Path {
+/// The directory to fsync for a file path, treating a bare filename as `.`.
+pub(crate) fn parent_dir(path: &Path) -> &Path {
     match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p,
         _ => Path::new("."),
@@ -240,12 +240,12 @@ fn parent_dir(path: &Path) -> &Path {
 /// existence — it is irrelevant to the `kill -9` done-when, which the OS page
 /// cache already survives.
 #[cfg(unix)]
-fn fsync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn fsync_dir(dir: &Path) -> io::Result<()> {
     File::open(dir)?.sync_all()
 }
 
 #[cfg(not(unix))]
-fn fsync_dir(_dir: &Path) -> io::Result<()> {
+pub(crate) fn fsync_dir(_dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
