@@ -1,6 +1,7 @@
-//! A tiny end-to-end demo of the Phase 1 store, with logging on.
+//! A tiny end-to-end demo of the store, with logging on. Phase 3: it now flushes
+//! to an SSTable and reads back across the memtable + disk tiers.
 //!
-//! Run it and watch the recovery/ops logs on stderr:
+//! Run it and watch the recovery/flush/ops logs on stderr:
 //!
 //! ```text
 //! QUORUMKV_LOG=trace cargo run --example demo
@@ -15,30 +16,29 @@ fn main() -> std::io::Result<()> {
     logger::init();
 
     let dir = std::env::temp_dir().join("quorumkv-demo");
-    std::fs::create_dir_all(&dir)?;
-    let wal = dir.join("wal.log");
-    let _ = std::fs::remove_file(&wal); // start clean each run
+    let _ = std::fs::remove_dir_all(&dir); // start clean each run
 
-    // First session: a few writes, an overwrite, and a delete.
+    // First session: a few writes, an overwrite, a delete, then a flush to disk.
     {
-        let db = Db::open(&wal)?;
+        let db = Db::open(&dir)?;
         db.put(b"name", b"quorumkv")?;
         db.put(b"lang", b"rust")?;
         db.put(b"name", b"quorumkv-storage")?; // overwrite
         db.delete(b"lang")?; // tombstone
-        log::info!(target: "demo", "session 1: name = {:?}", show(db.get(b"name")));
-        log::info!(target: "demo", "session 1: lang = {:?}", show(db.get(b"lang")));
+        db.flush()?; // freeze the memtable -> SSTable
+        log::info!(target: "demo", "session 1: name = {:?}", show(db.get(b"name")?));
+        log::info!(target: "demo", "session 1: lang = {:?}", show(db.get(b"lang")?));
     } // drop -> close
 
-    // Second session: reopen and prove state was rebuilt from the WAL.
+    // Second session: reopen and prove state was rebuilt from SSTable + WAL.
     {
-        let db = Db::open(&wal)?;
+        let db = Db::open(&dir)?;
         log::info!(
             target: "demo",
             "session 2 (after reopen): {} key(s), name = {:?}, lang = {:?}",
-            db.len(),
-            show(db.get(b"name")),
-            show(db.get(b"lang")),
+            db.len()?,
+            show(db.get(b"name")?),
+            show(db.get(b"lang")?),
         );
     }
 

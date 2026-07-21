@@ -1,8 +1,10 @@
-//! Phase 2 §6.9 — the skip-list payoff, end-to-end through `Db`.
+//! The skip-list payoff, end-to-end through `Db`, now with flushes happening
+//! concurrently with writes and reads (Phase 3).
 //!
-//! Many threads share one `Arc<Db>` and write distinct keys concurrently. All
-//! writes must survive (no lost updates), all must be durable (survive a reopen),
-//! and reads must be able to run while writes are in flight.
+//! Many threads share one `Arc<Db>` and write distinct keys concurrently while
+//! the memtable freezes and flushes to SSTables underneath them. All writes must
+//! survive (no lost updates), all must be durable (survive a reopen), and reads
+//! must run while writes and flushes are in flight.
 
 mod common;
 
@@ -18,11 +20,9 @@ fn concurrent_writers_no_lost_updates_and_durable() {
     const PER: usize = 250;
 
     let dir = TempDir::new();
-    let wal = dir.path("wal.log");
+    // Small threshold: forces many flushes while the writers are running.
+    let db = Arc::new(Db::open_with_threshold(&dir.0, 8 * 1024).unwrap());
 
-    let db = Arc::new(Db::open(&wal).unwrap());
-
-    // Writers: each thread owns a disjoint key range.
     let mut handles: Vec<_> = (0..THREADS)
         .map(|t| {
             let db = Arc::clone(&db);
@@ -35,14 +35,12 @@ fn concurrent_writers_no_lost_updates_and_durable() {
         })
         .collect();
 
-    // A concurrent reader, just to exercise lock-free reads during writes. It
-    // asserts nothing about *which* keys are present (writes are in flight) —
-    // only that reads don't block, corrupt, or panic.
+    // A concurrent reader exercising the cross-tier read path during flushes.
     {
         let db = Arc::clone(&db);
         handles.push(thread::spawn(move || {
             for _ in 0..2_000 {
-                let _ = db.get(b"t00-k0000");
+                let _ = db.get(b"t00-k0000").unwrap();
             }
         }));
     }
@@ -51,23 +49,23 @@ fn concurrent_writers_no_lost_updates_and_durable() {
         h.join().unwrap();
     }
 
-    // Every acknowledged write is present in memory...
-    assert_eq!(db.len(), THREADS * PER);
+    // Every acknowledged write is present (across memtable + SSTables)...
+    assert_eq!(db.len().unwrap(), THREADS * PER);
     for t in 0..THREADS {
         for i in 0..PER {
             let k = format!("t{t:02}-k{i:04}");
-            assert_eq!(db.get(k.as_bytes()), Some(k.as_bytes().to_vec()));
+            assert_eq!(db.get(k.as_bytes()).unwrap(), Some(k.as_bytes().to_vec()));
         }
     }
 
-    // ...and durable: a reopen replays the WAL to the identical state.
+    // ...and durable: a reopen (reload SSTables + replay WAL) is identical.
     drop(db);
-    let reopened = Db::open(&wal).unwrap();
-    assert_eq!(reopened.len(), THREADS * PER);
+    let reopened = Db::open(&dir.0).unwrap();
+    assert_eq!(reopened.len().unwrap(), THREADS * PER);
     for t in 0..THREADS {
         for i in 0..PER {
             let k = format!("t{t:02}-k{i:04}");
-            assert_eq!(reopened.get(k.as_bytes()), Some(k.as_bytes().to_vec()));
+            assert_eq!(reopened.get(k.as_bytes()).unwrap(), Some(k.as_bytes().to_vec()));
         }
     }
 }

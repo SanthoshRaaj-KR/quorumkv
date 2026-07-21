@@ -21,11 +21,11 @@ use storage::db::Db;
 #[test]
 fn acknowledged_writes_survive_kill9() {
     let dir = TempDir::new();
-    let wal = dir.path("wal.log");
+    let db_dir = dir.path("db");
 
     // Spawn the writer, piping its stdout so we can observe acknowledged keys.
     let mut child = Command::new(env!("CARGO_BIN_EXE_wal_crash_writer"))
-        .arg(&wal)
+        .arg(&db_dir)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn wal_crash_writer");
@@ -49,10 +49,10 @@ fn acknowledged_writes_survive_kill9() {
     drop(reader); // release the pipe / the child's file handle path
 
     // Restart: reopen the store and verify every acknowledged write survived.
-    let db = Db::open(&wal).expect("reopen after crash");
+    let db = Db::open(&db_dir).expect("reopen after crash");
     for key in &acked {
         assert_eq!(
-            db.get(key.as_bytes()),
+            db.get(key.as_bytes()).expect("get"),
             Some(key.as_bytes().to_vec()),
             "acknowledged key {key} was lost across the crash",
         );

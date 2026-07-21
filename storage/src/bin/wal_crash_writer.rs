@@ -1,7 +1,7 @@
 //! Crash-test writer (Phase 1, Task 6). Not part of the library API — it exists
 //! only to be spawned and `kill`ed by `tests/kill9.rs`.
 //!
-//! Usage: `wal_crash_writer <wal-path>`
+//! Usage: `wal_crash_writer <db-dir>`
 //!
 //! It opens a `Db` and PUTs keys forever. Crucially, it prints each key to
 //! stdout **only after `put` returns `Ok`** — i.e. after the WAL append fsynced.
@@ -14,11 +14,11 @@ use std::io::Write;
 use storage::db::Db;
 
 fn main() {
-    let path = std::env::args()
+    let dir = std::env::args()
         .nth(1)
-        .expect("usage: wal_crash_writer <wal-path>");
+        .expect("usage: wal_crash_writer <db-dir>");
 
-    let db = Db::open(&path).expect("open db");
+    let db = Db::open(&dir).expect("open db");
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();

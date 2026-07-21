@@ -243,6 +243,57 @@ pub fn sst_filename(file_number: u64) -> String {
     format!("{file_number:06}.sst")
 }
 
+/// Parse an SSTable file number from `NNNNNN.sst`, or `None` if it isn't one
+/// (notably rejects `.sst.tmp` orphans).
+pub fn parse_sst_number(name: &str) -> Option<u64> {
+    let digits = name.strip_suffix(".sst")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// List SSTables under `dir` as `(file_number, path)`, ascending by number. A
+/// missing directory yields an empty list.
+pub fn list_sstables(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let mut out = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            for entry in rd {
+                let entry = entry?;
+                if let Some(n) = entry.file_name().to_str().and_then(parse_sst_number) {
+                    out.push((n, entry.path()));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    out.sort_by_key(|(n, _)| *n);
+    Ok(out)
+}
+
+/// Remove any orphan `*.sst.tmp` files under `dir` — leftovers from a flush that
+/// crashed before its atomic rename (phase-03 §5). Best-effort per file.
+pub fn remove_orphan_tmp(dir: &Path) -> io::Result<()> {
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            for entry in rd {
+                let entry = entry?;
+                if let Some(name) = entry.file_name().to_str() {
+                    if name.ends_with(".sst.tmp") {
+                        let _ = std::fs::remove_file(entry.path());
+                        log::debug!(target: "sstable", "removed orphan flush temp {name}");
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    Ok(())
+}
+
 /// Streaming writer for one SSTable. Call [`add`](SstWriter::add) with entries in
 /// **strictly increasing key order**, then [`finish`](SstWriter::finish).
 ///
