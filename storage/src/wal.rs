@@ -310,6 +310,101 @@ pub fn replay(path: impl AsRef<Path>) -> io::Result<Vec<Record>> {
     Ok(recover(path)?.0)
 }
 
+// ────────────────────────────────────────────────────────────────────────────
+// Task 4 (Phase 3) — WAL segmentation.
+//
+// Phase 1 had a single WAL file. Now the WAL is a sequence of *segments*, one per
+// memtable generation (`wal-000001.log`, `wal-000002.log`, …). The active
+// memtable writes to the current segment; on freeze, the sealed memtable keeps
+// its segment and a new one is started. A segment is deleted only after the
+// SSTable it backs is durable (phase-03 §4c). These are the file-level primitives;
+// the freeze/roll/flush coordination that uses them is Task 5.
+// ────────────────────────────────────────────────────────────────────────────
+
+/// The WAL segment filename for a segment number, e.g. `wal-000001.log`.
+pub fn segment_filename(seg: u64) -> String {
+    format!("wal-{seg:06}.log")
+}
+
+/// Parse a segment number from a filename, or `None` if it isn't a WAL segment.
+pub fn parse_segment_number(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("wal-")?.strip_suffix(".log")?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse::<u64>().ok()
+}
+
+/// List WAL segments under `dir` as `(segment_number, path)`, ascending by number.
+/// A missing directory yields an empty list. Non-segment files are ignored.
+pub fn list_segments(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
+    let mut out = Vec::new();
+    match std::fs::read_dir(dir) {
+        Ok(rd) => {
+            for entry in rd {
+                let entry = entry?;
+                if let Some(n) = entry.file_name().to_str().and_then(parse_segment_number) {
+                    out.push((n, entry.path()));
+                }
+            }
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    out.sort_by_key(|(n, _)| *n);
+    Ok(out)
+}
+
+/// Everything recovered from a directory's surviving WAL segments.
+#[derive(Debug)]
+pub struct SegmentRecovery {
+    /// All complete records across the segments, oldest segment first, in order —
+    /// ready to fold into a memtable (these are acked-but-not-yet-flushed writes).
+    pub records: Vec<Record>,
+    /// The segments found, `(number, path)`, ascending. Empty if none.
+    pub segments: Vec<(u64, PathBuf)>,
+    /// Valid byte length of the newest segment, where a torn tail was trimmed. The
+    /// caller uses this to heal that segment's tail before appending to it. 0 if
+    /// there are no segments.
+    pub last_valid_len: u64,
+}
+
+/// Recover across all WAL segments in `dir`, in order.
+///
+/// Only the newest segment can have a torn tail (a crash while writing it); older
+/// segments were sealed at freeze time and are complete. Each segment is decoded
+/// torn-tail-safe regardless, and the newest's valid length is reported for tail
+/// healing (phase-03 §4c).
+pub fn recover_segments(dir: &Path) -> io::Result<SegmentRecovery> {
+    let segments = list_segments(dir)?;
+    let mut records = Vec::new();
+    let mut last_valid_len = 0u64;
+    let count = segments.len();
+    for (i, (_, path)) in segments.iter().enumerate() {
+        let (recs, valid_len) = recover(path)?;
+        records.extend(recs);
+        if i + 1 == count {
+            last_valid_len = valid_len;
+        }
+    }
+    log::debug!(
+        target: "wal",
+        "recover_segments: {} segment(s), {} record(s)",
+        count,
+        records.len(),
+    );
+    Ok(SegmentRecovery { records, segments, last_valid_len })
+}
+
+/// Delete a WAL segment (called once the SSTable it backs is durable). Deletion
+/// need not be fsynced: a crash that loses the deletion just replays already-
+/// flushed data, which is idempotent (phase-03 §5).
+pub fn remove_segment(path: &Path) -> io::Result<()> {
+    std::fs::remove_file(path)?;
+    log::debug!(target: "wal", "removed segment {}", path.display());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,5 +715,97 @@ mod tests {
         // Only the clean prefix (record #1) survives; #2 fails CRC and #3 is
         // unreachable behind it.
         assert_eq!(replay(&path).unwrap(), vec![put(b"one", b"1")]);
+    }
+
+    // ── Task 4: WAL segmentation ──────────────────────────────────────────────
+
+    #[test]
+    fn segment_filename_and_parse_round_trip() {
+        assert_eq!(segment_filename(1), "wal-000001.log");
+        assert_eq!(segment_filename(42), "wal-000042.log");
+        assert_eq!(parse_segment_number("wal-000001.log"), Some(1));
+        assert_eq!(parse_segment_number("wal-000042.log"), Some(42));
+    }
+
+    #[test]
+    fn parse_segment_number_rejects_non_segments() {
+        assert_eq!(parse_segment_number("wal.log"), None);
+        assert_eq!(parse_segment_number("000001.sst"), None);
+        assert_eq!(parse_segment_number("wal-.log"), None);
+        assert_eq!(parse_segment_number("wal-12ab.log"), None);
+        assert_eq!(parse_segment_number("wal-000001.log.tmp"), None);
+    }
+
+    #[test]
+    fn list_segments_sorts_ascending_and_ignores_others() {
+        let dir = TempDir::new();
+        // Create segments out of order, plus non-segment files.
+        for n in [3u64, 1, 2] {
+            WalWriter::open(dir.path(&segment_filename(n))).unwrap();
+        }
+        std::fs::write(dir.path("000001.sst"), b"not a segment").unwrap();
+        std::fs::write(dir.path("wal.log"), b"old single wal").unwrap();
+
+        let segs = list_segments(&dir.0).unwrap();
+        let nums: Vec<u64> = segs.iter().map(|(n, _)| *n).collect();
+        assert_eq!(nums, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn list_segments_missing_dir_is_empty() {
+        let dir = TempDir::new();
+        let missing = dir.0.join("does-not-exist");
+        assert!(list_segments(&missing).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recover_segments_concatenates_in_order() {
+        let dir = TempDir::new();
+        {
+            let mut w1 = WalWriter::open(dir.path(&segment_filename(1))).unwrap();
+            w1.append(&put(b"a", b"1")).unwrap();
+            w1.append(&put(b"b", b"2")).unwrap();
+        }
+        {
+            let mut w2 = WalWriter::open(dir.path(&segment_filename(2))).unwrap();
+            w2.append(&del(b"a")).unwrap();
+            w2.append(&put(b"c", b"3")).unwrap();
+        }
+        let rec = recover_segments(&dir.0).unwrap();
+        assert_eq!(rec.records, vec![put(b"a", b"1"), put(b"b", b"2"), del(b"a"), put(b"c", b"3")]);
+        assert_eq!(rec.segments.len(), 2);
+    }
+
+    #[test]
+    fn recover_segments_trims_torn_tail_of_newest() {
+        let dir = TempDir::new();
+        {
+            let mut w1 = WalWriter::open(dir.path(&segment_filename(1))).unwrap();
+            w1.append(&put(b"a", b"1")).unwrap();
+        }
+        let seg2 = dir.path(&segment_filename(2));
+        let clean_len = {
+            let mut w2 = WalWriter::open(&seg2).unwrap();
+            w2.append(&put(b"b", b"2")).unwrap();
+            std::fs::metadata(&seg2).unwrap().len()
+        };
+        // A crash mid-write of a third record in the newest segment.
+        let partial = encode_record(&put(b"c", b"3"));
+        append_raw(&seg2, &partial[..partial.len() - 2]);
+
+        let rec = recover_segments(&dir.0).unwrap();
+        assert_eq!(rec.records, vec![put(b"a", b"1"), put(b"b", b"2")]);
+        assert_eq!(rec.last_valid_len, clean_len); // torn tail reported for healing
+    }
+
+    #[test]
+    fn remove_segment_deletes_the_file() {
+        let dir = TempDir::new();
+        let path = dir.path(&segment_filename(1));
+        WalWriter::open(&path).unwrap();
+        assert!(path.exists());
+        remove_segment(&path).unwrap();
+        assert!(!path.exists());
+        assert!(list_segments(&dir.0).unwrap().is_empty());
     }
 }
