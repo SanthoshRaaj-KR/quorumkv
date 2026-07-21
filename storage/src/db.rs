@@ -170,11 +170,21 @@ impl Db {
             }
         }
         for sst in &sstables {
+            // Bloom pre-check: "definitely not here" → skip the file, zero disk I/O.
+            if !sst.maybe_contains(key) {
+                continue;
+            }
             if let Some(v) = sst.get(key)? {
                 return Ok(marker_to_value(v));
             }
         }
         Ok(None)
+    }
+
+    /// Total data-block reads across all live SSTables — a metrics/test hook. With
+    /// Bloom filters, a `get` for an absent key should leave this unchanged.
+    pub fn sstable_block_reads(&self) -> u64 {
+        self.snapshot().2.iter().map(|s| s.block_reads()).sum()
     }
 
     /// Force the active memtable to flush now (no-op if empty). Deterministic
