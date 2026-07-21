@@ -52,6 +52,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicU64};
 
+use crate::bloom::{BloomFilter, DEFAULT_BITS_PER_KEY};
 use crate::memtable::Value;
 use crate::wal::{fsync_dir, parent_dir};
 
@@ -67,10 +68,11 @@ const VTYPE_DELETE: u8 = 0x02;
 
 /// Footer magic: ASCII "QSST", identifies a quorumkv SSTable.
 pub const MAGIC: u32 = 0x5153_5354;
-/// On-disk format version.
-pub const VERSION: u8 = 1;
-/// Fixed footer width: `index_offset(8) + index_len(4) + magic(4) + version(1)`.
-pub const FOOTER_LEN: usize = 8 + 4 + 4 + 1;
+/// On-disk format version. v2 (Phase 4) adds the Bloom block + its footer fields.
+pub const VERSION: u8 = 2;
+/// Fixed footer width: `index_offset(8) + index_len(4) + bloom_offset(8) +
+/// bloom_len(4) + magic(4) + version(1)`.
+pub const FOOTER_LEN: usize = 8 + 4 + 8 + 4 + 4 + 1;
 
 /// Why a byte slice could not be parsed as part of an SSTable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -168,11 +170,14 @@ pub fn decode_index_entry(buf: &[u8]) -> Result<(Vec<u8>, u64, u32, usize), SstF
 
 // ── Footer ───────────────────────────────────────────────────────────────────
 
-/// The fixed-width trailer a reader loads first to bootstrap the file.
+/// The fixed-width trailer a reader loads first to bootstrap the file. Points at
+/// both the sparse index and (Phase 4) the Bloom block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Footer {
     pub index_offset: u64,
     pub index_len: u32,
+    pub bloom_offset: u64,
+    pub bloom_len: u32,
 }
 
 /// Encode the footer to its fixed byte width.
@@ -180,8 +185,10 @@ pub fn encode_footer(footer: &Footer) -> [u8; FOOTER_LEN] {
     let mut b = [0u8; FOOTER_LEN];
     b[0..8].copy_from_slice(&footer.index_offset.to_le_bytes());
     b[8..12].copy_from_slice(&footer.index_len.to_le_bytes());
-    b[12..16].copy_from_slice(&MAGIC.to_le_bytes());
-    b[16] = VERSION;
+    b[12..20].copy_from_slice(&footer.bloom_offset.to_le_bytes());
+    b[20..24].copy_from_slice(&footer.bloom_len.to_le_bytes());
+    b[24..28].copy_from_slice(&MAGIC.to_le_bytes());
+    b[28] = VERSION;
     b
 }
 
@@ -191,17 +198,19 @@ pub fn decode_footer(buf: &[u8]) -> Result<Footer, SstFormatError> {
     if buf.len() < FOOTER_LEN {
         return Err(SstFormatError::UnexpectedEof);
     }
-    let magic = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+    let magic = u32::from_le_bytes(buf[24..28].try_into().unwrap());
     if magic != MAGIC {
         return Err(SstFormatError::BadMagic(magic));
     }
-    let version = buf[16];
+    let version = buf[28];
     if version != VERSION {
         return Err(SstFormatError::BadVersion(version));
     }
     Ok(Footer {
         index_offset: u64::from_le_bytes(buf[0..8].try_into().unwrap()),
         index_len: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
+        bloom_offset: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
+        bloom_len: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
     })
 }
 
@@ -317,11 +326,16 @@ pub struct SstWriter {
     entry_count: u64,
     /// Last key added, for the strictly-increasing debug assertion.
     last_key: Option<Vec<u8>>,
+    /// Bloom filter built as keys stream through (every key, Put and Delete).
+    bloom: BloomFilter,
 }
 
 impl SstWriter {
     /// Create a writer for `file_number` under `dir` (opens the `.tmp` file).
-    pub fn create(dir: &Path, file_number: u64) -> io::Result<Self> {
+    ///
+    /// `num_keys` sizes the Bloom filter (use the memtable's entry count);
+    /// `bits_per_key` is the false-positive/RAM knob.
+    pub fn create(dir: &Path, file_number: u64, num_keys: usize, bits_per_key: u32) -> io::Result<Self> {
         let final_path = dir.join(sst_filename(file_number));
         let tmp_path = dir.join(format!("{}.tmp", sst_filename(file_number)));
         let file = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path)?;
@@ -335,6 +349,7 @@ impl SstWriter {
             index: Vec::new(),
             entry_count: 0,
             last_key: None,
+            bloom: BloomFilter::new(num_keys, bits_per_key),
         })
     }
 
@@ -345,6 +360,10 @@ impl SstWriter {
             self.last_key.as_deref().is_none_or(|lk| lk < key),
             "SSTable entries must be added in strictly increasing key order",
         );
+
+        // Every key goes into the Bloom filter — Put and Delete alike, or a
+        // bloom-skip would resurrect a deleted key (phase-04 §1).
+        self.bloom.insert(key);
 
         if self.block.is_empty() {
             self.block_first_key = Some(key.to_vec());
@@ -392,7 +411,14 @@ impl SstWriter {
         self.file.write_all(&self.index)?;
         self.offset += u64::from(index_len);
 
-        let footer = encode_footer(&Footer { index_offset, index_len });
+        // Bloom block sits between the index and the footer.
+        let bloom_bytes = self.bloom.serialize();
+        let bloom_offset = self.offset;
+        let bloom_len = bloom_bytes.len() as u32;
+        self.file.write_all(&bloom_bytes)?;
+        self.offset += u64::from(bloom_len);
+
+        let footer = encode_footer(&Footer { index_offset, index_len, bloom_offset, bloom_len });
         self.file.write_all(&footer)?;
 
         // Durable-then-visible: fsync the bytes, atomically rename into place,
@@ -430,9 +456,16 @@ impl SstWriter {
 
 /// Flush a sorted entry stream to one SSTable under `dir`, or skip it.
 ///
-/// Returns `Ok(Some(path))` for a written file, or `Ok(None)` if `entries` was
-/// empty (we never write a 0-entry SSTable — phase-03 §5).
-pub fn write_sstable<I>(dir: &Path, file_number: u64, entries: I) -> io::Result<Option<PathBuf>>
+/// `num_keys` sizes the Bloom filter (the memtable's entry count). Returns
+/// `Ok(Some(path))` for a written file, or `Ok(None)` if `entries` was empty (we
+/// never write a 0-entry SSTable — phase-03 §5).
+pub fn write_sstable<I>(
+    dir: &Path,
+    file_number: u64,
+    entries: I,
+    num_keys: usize,
+    bits_per_key: u32,
+) -> io::Result<Option<PathBuf>>
 where
     I: IntoIterator<Item = (Vec<u8>, Value)>,
 {
@@ -441,7 +474,7 @@ where
         log::debug!(target: "sstable", "skipping flush: no entries");
         return Ok(None);
     }
-    let mut w = SstWriter::create(dir, file_number)?;
+    let mut w = SstWriter::create(dir, file_number, num_keys, bits_per_key)?;
     for (key, value) in it {
         w.add(&key, &value)?;
     }
@@ -472,13 +505,17 @@ pub struct SstReader {
     file: File,
     index: Vec<IndexEntry>,
     path: PathBuf,
+    /// RAM-resident Bloom filter — the "definitely not here?" gate before any
+    /// block read (phase-04). Loaded once at open, never mutated after.
+    bloom: BloomFilter,
     /// Count of data blocks pulled from disk — instrumentation for the
     /// sparse-index test (proves a `get` reads one block, not the whole file).
     block_reads: AtomicU64,
 }
 
 impl SstReader {
-    /// Open an SSTable: read+validate the footer, load the sparse index into RAM.
+    /// Open an SSTable: read+validate the footer, load the sparse index and the
+    /// Bloom filter into RAM.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let file = File::open(&path)?;
@@ -503,7 +540,15 @@ impl SstReader {
             off += consumed;
         }
 
-        Ok(SstReader { file, index, path, block_reads: AtomicU64::new(0) })
+        let bloom = load_bloom(&file, &index, &footer, &path)?;
+
+        Ok(SstReader { file, index, path, bloom, block_reads: AtomicU64::new(0) })
+    }
+
+    /// The Bloom pre-check: `false` = key is definitely not in this file (skip it,
+    /// zero disk I/O); `true` = maybe present, do the real `get`.
+    pub fn maybe_contains(&self, key: &[u8]) -> bool {
+        self.bloom.maybe_contains(key)
     }
 
     /// Look up `key`. Returns the on-disk marker: `Some(Put)`, `Some(Delete)`
@@ -579,6 +624,46 @@ impl SstReader {
 
 fn to_io(e: SstFormatError) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, e)
+}
+
+/// Load the Bloom filter for an SSTable, **rebuilding it from the data keys** if
+/// the stored block is missing or its CRC fails. The filter is derived data, so
+/// corruption is never a data-loss event — just a rebuild (phase-04 §4).
+fn load_bloom(
+    file: &File,
+    index: &[IndexEntry],
+    footer: &Footer,
+    path: &Path,
+) -> io::Result<BloomFilter> {
+    if footer.bloom_len > 0 {
+        let mut buf = vec![0u8; footer.bloom_len as usize];
+        read_exact_at(file, &mut buf, footer.bloom_offset)?;
+        match BloomFilter::deserialize(&buf) {
+            Ok(bloom) => return Ok(bloom),
+            Err(e) => log::warn!(
+                target: "sstable",
+                "bloom block corrupt in {} ({e:?}); rebuilding from data",
+                path.display(),
+            ),
+        }
+    }
+    rebuild_bloom(file, index)
+}
+
+/// Rebuild a Bloom filter by scanning every key in the SSTable's data blocks.
+fn rebuild_bloom(file: &File, index: &[IndexEntry]) -> io::Result<BloomFilter> {
+    let mut keys: Vec<Vec<u8>> = Vec::new();
+    for e in index {
+        let mut buf = vec![0u8; e.len as usize];
+        read_exact_at(file, &mut buf, e.offset)?;
+        let mut off = 0usize;
+        while off < buf.len() {
+            let (k, _v, consumed) = decode_entry(&buf[off..]).map_err(to_io)?;
+            keys.push(k);
+            off += consumed;
+        }
+    }
+    Ok(BloomFilter::build(keys.iter().map(Vec::as_slice), keys.len(), DEFAULT_BITS_PER_KEY))
 }
 
 /// Positioned `read_exact` that does not disturb any shared file cursor, so it is
