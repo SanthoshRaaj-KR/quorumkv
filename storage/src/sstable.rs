@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn footer_round_trips() {
-        let f = Footer { index_offset: 123_456, index_len: 789 };
+        let f = Footer { index_offset: 123_456, index_len: 789, bloom_offset: 124_245, bloom_len: 640 };
         let bytes = encode_footer(&f);
         assert_eq!(bytes.len(), FOOTER_LEN);
         assert_eq!(decode_footer(&bytes).unwrap(), f);
@@ -801,15 +801,15 @@ mod tests {
 
     #[test]
     fn footer_rejects_bad_magic() {
-        let mut bytes = encode_footer(&Footer { index_offset: 1, index_len: 2 });
-        bytes[12] ^= 0xFF; // corrupt the magic
+        let mut bytes = encode_footer(&Footer { index_offset: 1, index_len: 2, bloom_offset: 3, bloom_len: 4 });
+        bytes[24] ^= 0xFF; // corrupt the magic (now at offset 24)
         assert!(matches!(decode_footer(&bytes), Err(SstFormatError::BadMagic(_))));
     }
 
     #[test]
     fn footer_rejects_bad_version() {
-        let mut bytes = encode_footer(&Footer { index_offset: 1, index_len: 2 });
-        bytes[16] = 99; // bogus version
+        let mut bytes = encode_footer(&Footer { index_offset: 1, index_len: 2, bloom_offset: 3, bloom_len: 4 });
+        bytes[28] = 99; // bogus version (now at offset 28)
         assert_eq!(decode_footer(&bytes), Err(SstFormatError::BadVersion(99)));
     }
 
@@ -853,7 +853,8 @@ mod tests {
     }
 
     fn write_and_read(dir: &TempDir, num: u64, entries: Vec<(Vec<u8>, Value)>) -> (Vec<(Vec<u8>, Value)>, usize, PathBuf) {
-        let path = write_sstable(&dir.0, num, entries).unwrap().unwrap();
+        let n = entries.len();
+        let path = write_sstable(&dir.0, num, entries, n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let (parsed, blocks) = parse_sst(&bytes);
         (parsed, blocks, path)
@@ -875,7 +876,7 @@ mod tests {
     #[test]
     fn no_tmp_file_remains_after_write() {
         let dir = TempDir::new();
-        let path = write_sstable(&dir.0, 7, vec![(b"k".to_vec(), Value::Put(b"v".to_vec()))])
+        let path = write_sstable(&dir.0, 7, vec![(b"k".to_vec(), Value::Put(b"v".to_vec()))], 1, DEFAULT_BITS_PER_KEY)
             .unwrap()
             .unwrap();
         assert!(path.exists());
@@ -887,7 +888,7 @@ mod tests {
     fn empty_stream_writes_no_file() {
         let dir = TempDir::new();
         let entries: Vec<(Vec<u8>, Value)> = Vec::new();
-        assert!(write_sstable(&dir.0, 1, entries).unwrap().is_none());
+        assert!(write_sstable(&dir.0, 1, entries, 0, DEFAULT_BITS_PER_KEY).unwrap().is_none());
         assert!(!dir.0.join("000001.sst").exists());
         assert!(!dir.0.join("000001.sst.tmp").exists());
     }
@@ -952,7 +953,8 @@ mod tests {
     // ── Task 3: SstReader ────────────────────────────────────────────────────
 
     fn write_reader(dir: &TempDir, num: u64, entries: Vec<(Vec<u8>, Value)>) -> SstReader {
-        let path = write_sstable(&dir.0, num, entries).unwrap().unwrap();
+        let n = entries.len();
+        let path = write_sstable(&dir.0, num, entries, n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
         SstReader::open(path).unwrap()
     }
 
@@ -1041,6 +1043,62 @@ mod tests {
             .collect();
         let r = write_reader(&dir, 6, entries.clone());
         for (k, v) in &entries {
+            assert_eq!(r.get(k).unwrap(), Some(v.clone()));
+        }
+    }
+
+    // ── Task 3: Bloom filter in the SSTable ──────────────────────────────────
+
+    #[test]
+    fn reader_bloom_has_no_false_negatives() {
+        let dir = TempDir::new();
+        let entries: Vec<_> = (0..1_000u32)
+            .map(|i| (format!("key{i:05}").into_bytes(), Value::Put(b"v".to_vec())))
+            .collect();
+        let r = write_reader(&dir, 1, entries.clone());
+        // Every written key must bloom-hit (safety invariant, file level).
+        for (k, _) in &entries {
+            assert!(r.maybe_contains(k), "false negative for {:?}", String::from_utf8_lossy(k));
+        }
+    }
+
+    #[test]
+    fn reader_bloom_includes_tombstone_keys() {
+        // The §1 corollary: a Delete's key MUST be in the filter, or a bloom-skip
+        // would miss the tombstone and resurrect the deleted value.
+        let dir = TempDir::new();
+        let r = write_reader(
+            &dir,
+            1,
+            vec![
+                (b"alive".to_vec(), Value::Put(b"v".to_vec())),
+                (b"dead".to_vec(), Value::Delete),
+            ],
+        );
+        assert!(r.maybe_contains(b"dead"), "tombstone key must be in the filter");
+        assert_eq!(r.get(b"dead").unwrap(), Some(Value::Delete));
+    }
+
+    #[test]
+    fn corrupt_bloom_block_rebuilds_and_reads_work() {
+        let dir = TempDir::new();
+        let entries: Vec<_> = (0..300u32)
+            .map(|i| (format!("k{i:05}").into_bytes(), Value::Put(format!("v{i}").into_bytes())))
+            .collect();
+        let n = entries.len();
+        let path = write_sstable(&dir.0, 1, entries.clone(), n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
+
+        // Corrupt a byte inside the on-disk Bloom block.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let footer = decode_footer(&bytes[bytes.len() - FOOTER_LEN..]).unwrap();
+        let corrupt_at = footer.bloom_offset as usize + footer.bloom_len as usize / 2;
+        bytes[corrupt_at] ^= 0xFF;
+        std::fs::write(&path, &bytes).unwrap();
+
+        // Reopen: the CRC fails, the filter rebuilds from data — no error, no loss.
+        let r = SstReader::open(&path).unwrap();
+        for (k, v) in &entries {
+            assert!(r.maybe_contains(k)); // rebuilt filter still has every key
             assert_eq!(r.get(k).unwrap(), Some(v.clone()));
         }
     }

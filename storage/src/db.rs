@@ -27,6 +27,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::bloom::DEFAULT_BITS_PER_KEY;
 use crate::memtable::{Memtable, Value, DEFAULT_THRESHOLD};
 use crate::sstable::{list_sstables, remove_orphan_tmp, sst_filename, write_sstable, SstReader};
 use crate::wal::{
@@ -37,6 +38,8 @@ use crate::wal::{
 pub struct Db {
     dir: PathBuf,
     threshold: usize,
+    /// Bloom bits-per-key for SSTables this store flushes (phase-04 knob).
+    bits_per_key: u32,
     write: Mutex<WriteState>,
     layers: RwLock<Layers>,
 }
@@ -119,6 +122,7 @@ impl Db {
         Ok(Db {
             dir,
             threshold,
+            bits_per_key: DEFAULT_BITS_PER_KEY,
             write: Mutex::new(WriteState { wal, active_gen }),
             layers: RwLock::new(Layers { active, immutable: Vec::new(), sstables }),
         })
@@ -238,7 +242,7 @@ impl Db {
         w.active_gen = new_gen;
 
         // Flush the sealed memtable to disk (no layers lock — this is the slow part).
-        let path = write_sstable(&self.dir, sealed_gen, sealed.iter())?
+        let path = write_sstable(&self.dir, sealed_gen, sealed.iter(), sealed.len(), self.bits_per_key)?
             .expect("a non-empty sealed memtable always produces an SSTable");
         let reader = Arc::new(SstReader::open(&path)?);
 
