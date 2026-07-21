@@ -20,6 +20,10 @@ log = "0.4"
 # uses). LOCKED in planning/phase-02-memtable.md §2.
 crossbeam-skiplist = "0.1"
 
+# Phase 4: fast non-cryptographic hash for the blocked Bloom filter (xxh3).
+# Pure Rust, no build script. LOCKED in planning/phase-04-bloom.md §8.
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
 # No dev-dependencies: tests use a small std-only temp-dir helper (see tests/).
 # Rationale: the windows-gnu toolchain on this machine has no external mingw, so
 # crates using `raw-dylib` system imports (tempfile -> windows-sys) can't link.
