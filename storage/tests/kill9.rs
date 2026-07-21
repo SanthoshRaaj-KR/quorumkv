@@ -59,3 +59,45 @@ fn acknowledged_writes_survive_kill9() {
     }
     assert_eq!(acked.len(), ACKED);
 }
+
+/// Same crash test, but with a tiny flush threshold so the writer is constantly
+/// flushing — a kill is likely to land mid-flush (before rename, after rename,
+/// or mid WAL-segment-delete). Every acknowledged key must still survive, proving
+/// the temp→rename→delete flush discipline holds under a real crash.
+#[test]
+fn acknowledged_writes_survive_kill9_with_flushes() {
+    let dir = TempDir::new();
+    let db_dir = dir.path("db");
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_wal_crash_writer"))
+        .arg(&db_dir)
+        .arg("2048") // tiny flush threshold -> frequent flushes
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("spawn wal_crash_writer");
+
+    let mut reader = BufReader::new(child.stdout.take().expect("child stdout"));
+
+    // Read enough acked keys to guarantee several flushes have occurred.
+    const ACKED: usize = 300;
+    let mut acked = Vec::with_capacity(ACKED);
+    for _ in 0..ACKED {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line).expect("read child stdout");
+        assert!(n > 0, "writer exited before acknowledging {ACKED} writes");
+        acked.push(line.trim_end().to_string());
+    }
+
+    child.kill().expect("kill writer");
+    let _ = child.wait();
+    drop(reader);
+
+    let db = Db::open(&db_dir).expect("reopen after crash");
+    for key in &acked {
+        assert_eq!(
+            db.get(key.as_bytes()).expect("get"),
+            Some(key.as_bytes().to_vec()),
+            "acknowledged key {key} lost across a crash-during-flush",
+        );
+    }
+}

@@ -1,24 +1,31 @@
 //! Crash-test writer (Phase 1, Task 6). Not part of the library API — it exists
 //! only to be spawned and `kill`ed by `tests/kill9.rs`.
 //!
-//! Usage: `wal_crash_writer <db-dir>`
+//! Usage: `wal_crash_writer <db-dir> [flush-threshold-bytes]`
 //!
 //! It opens a `Db` and PUTs keys forever. Crucially, it prints each key to
-//! stdout **only after `put` returns `Ok`** — i.e. after the WAL append fsynced.
-//! A printed key is therefore an *acknowledged* write and MUST survive a crash.
-//! The harness reads those printed keys, kills this process, reopens the store,
-//! and asserts every one is still there.
+//! stdout **only after `put` returns `Ok`** — i.e. after the WAL append fsynced
+//! (and any triggered flush completed). A printed key is therefore an
+//! *acknowledged* write and MUST survive a crash. The harness reads those printed
+//! keys, kills this process, reopens the store, and asserts every one is there.
+//!
+//! An optional small flush threshold makes flushes happen constantly, so a kill
+//! is likely to land mid-flush — exercising the temp→rename→delete crash window.
 
 use std::io::Write;
 
 use storage::db::Db;
 
 fn main() {
-    let dir = std::env::args()
-        .nth(1)
-        .expect("usage: wal_crash_writer <db-dir>");
+    let args: Vec<String> = std::env::args().collect();
+    let dir = args.get(1).expect("usage: wal_crash_writer <db-dir> [threshold]");
+    let threshold: Option<usize> = args.get(2).and_then(|s| s.parse().ok());
 
-    let db = Db::open(&dir).expect("open db");
+    let db = match threshold {
+        Some(t) => Db::open_with_threshold(dir, t),
+        None => Db::open(dir),
+    }
+    .expect("open db");
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
