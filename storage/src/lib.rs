@@ -9,6 +9,7 @@
 //!
 //! Nothing here knows about clusters or replication; that is Track B (Go).
 
+pub mod bloom;
 pub mod db;
 pub mod logger;
 pub mod memtable;
