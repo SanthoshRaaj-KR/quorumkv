@@ -13,6 +13,7 @@ pub mod bloom;
 pub mod db;
 pub mod logger;
 pub mod memtable;
+pub mod merge;
 pub mod sstable;
 pub mod wal;
 
