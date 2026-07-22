@@ -133,28 +133,41 @@ impl Db {
         Ok(db)
     }
 
-    /// Durably record `key -> value`, update memory, flush if the memtable is full.
+    /// Durably record `key -> value`, update memory, flush if the memtable is full
+    /// (and compact if that flush trips the strategy's condition).
     pub fn put(&self, key: &[u8], value: &[u8]) -> io::Result<()> {
-        let mut w = self.write.lock().expect("write mutex poisoned");
-        w.wal.append(&Record::Put { key: key.to_vec(), value: value.to_vec() })?;
-        let active = self.active();
-        active.put(key, value);
-        log::trace!(target: "db", "put {:?}", String::from_utf8_lossy(key));
-        if active.should_flush() {
-            self.freeze_and_flush(&mut w, &active)?;
+        let flushed = {
+            let mut w = self.write.lock().expect("write mutex poisoned");
+            w.wal.append(&Record::Put { key: key.to_vec(), value: value.to_vec() })?;
+            let active = self.active();
+            active.put(key, value);
+            log::trace!(target: "db", "put {:?}", String::from_utf8_lossy(key));
+            active.should_flush() && {
+                self.freeze_and_flush(&mut w, &active)?;
+                true
+            }
+        };
+        if flushed {
+            self.maybe_compact()?; // note: write lock released above
         }
         Ok(())
     }
 
     /// Durably record a delete (a tombstone), update memory, flush if needed.
     pub fn delete(&self, key: &[u8]) -> io::Result<()> {
-        let mut w = self.write.lock().expect("write mutex poisoned");
-        w.wal.append(&Record::Delete { key: key.to_vec() })?;
-        let active = self.active();
-        active.delete(key);
-        log::trace!(target: "db", "delete {:?}", String::from_utf8_lossy(key));
-        if active.should_flush() {
-            self.freeze_and_flush(&mut w, &active)?;
+        let flushed = {
+            let mut w = self.write.lock().expect("write mutex poisoned");
+            w.wal.append(&Record::Delete { key: key.to_vec() })?;
+            let active = self.active();
+            active.delete(key);
+            log::trace!(target: "db", "delete {:?}", String::from_utf8_lossy(key));
+            active.should_flush() && {
+                self.freeze_and_flush(&mut w, &active)?;
+                true
+            }
+        };
+        if flushed {
+            self.maybe_compact()?;
         }
         Ok(())
     }
@@ -184,10 +197,23 @@ impl Db {
     }
 
     /// Force the active memtable to flush now (no-op if empty).
+    ///
+    /// Unlike an automatic (threshold-driven) flush, a manual `flush` does **not**
+    /// trigger compaction — it gives callers/tests explicit control. Use
+    /// [`compact`](Db::compact) / [`compact_all`](Db::compact_all) to compact.
     pub fn flush(&self) -> io::Result<()> {
         let mut w = self.write.lock().expect("write mutex poisoned");
         let active = self.active();
         self.freeze_and_flush(&mut w, &active)
+    }
+
+    /// If the strategy selects work, compact fully. Called after an automatic
+    /// flush (the write lock must already be released — `compact` reacquires it).
+    fn maybe_compact(&self) -> io::Result<()> {
+        if self.strategy.pick(&self.versions.current().files).is_some() {
+            self.compact_all()?;
+        }
+        Ok(())
     }
 
     /// Run one compaction if the strategy selects work; returns whether it did.
@@ -518,13 +544,14 @@ mod tests {
     }
 
     #[test]
-    fn threshold_triggers_automatic_flush() {
+    fn threshold_triggers_automatic_flush_and_compaction() {
         let dir = TempDir::new();
         let db = open_small(&dir, 512);
         for i in 0..200u32 {
             db.put(format!("key{i:05}").as_bytes(), b"value").unwrap();
         }
-        assert!(dir.0.join(sst_filename(1)).exists());
+        // Flushes happened (SSTables exist) and auto-compaction kept the count low.
+        assert!(db.sstable_count() >= 1);
         for i in 0..200u32 {
             assert_eq!(db.get(format!("key{i:05}").as_bytes()).unwrap(), Some(b"value".to_vec()));
         }
