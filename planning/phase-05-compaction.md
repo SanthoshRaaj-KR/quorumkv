@@ -201,3 +201,63 @@ Test 4 guards the correctness core; test 5 guards durability of the swap.
 (Ph1), sorted in-memory (Ph2), immutable on-disk with a working read path (Ph3),
 fast skips (Ph4), and self-compacting (Ph5). It could ship as a library on its
 own. Track B (Raft) now builds independently until they meet at Phase 10.
+
+---
+
+## 8. Status — what shipped, and what is carried forward
+
+Audited 2026-07-23, before starting Phase 6. The done-when (§6.1–6.3) **passes**
+and 131 tests are green. The MANIFEST, the atomic swap, the orphan sweep, the
+Bloom rebuild, reader-cache eviction, and reads-during-compaction are all real
+and tested. What follows is the honest gap list, so Phase 6 doesn't bury it.
+
+### Locked decisions not yet implemented
+
+| # | Decision (§7) | Actual | Impact |
+|---|---|---|---|
+| A1 | **Leveled** picker (the stated *target* for the read-heavy workload) | only `SizeTiered` exists | the phase's headline decision is unshipped; §6.7 can't run |
+| A2 | `FileMeta` carries a **key range** (§3: `AddFile(n, level, key-range)`) | `manifest.rs:30` has `number` + `level` only | **blocks A1** — leveled needs ranges for overlap checks. Adding it is a MANIFEST record-format change, so do it *with* A1, not before |
+| A3 | Compaction on a **background thread** | `Db::compact` holds the write mutex for the whole merge (`db.rs:223`) | writes block for the full compaction. §4c's "writes and flushes continue concurrently" is false today. *Reads* do stay live — that part is real |
+| A4 | Files-being-compacted **marking** | absent | moot while A3 serializes everything; becomes mandatory the moment A3 lands |
+| A5 | k-way merge via **min-heap** | linear O(k) scan of all sources per entry (`merge.rs:48`) | correct, but 150 inputs = 150 peeks per output entry |
+
+### Behavioral gap — the tombstone safety path is unreachable
+
+`SizeTiered::pick` (`compaction.rs:63`) always merges **every** live file and
+always sets `is_bottom_most: true`. Three consequences:
+
+- It isn't really size-tiered — there's no size bucketing, just "merge
+  everything once ≥ `min_run` files exist."
+- `output_level` is always 0; `FileMeta::level` is written but never read.
+- **`is_bottom_most: false` is unreachable from production code.** The §2
+  tombstone carry-forward rule — "the most important thing in the phase" — is
+  implemented in `merge.rs` and unit-tested via hand-built `Compaction` structs,
+  but no strategy can produce it. It is correct code on a dead path until A1.
+
+### Test plan coverage
+
+| §6 test | Status |
+|---|---|
+| 1 space drops / 2 latest value | ✅ `compaction_donewhen.rs` (uses 150 rounds, not the doc's literal 1000 — runtime tradeoff; property is proven either way) |
+| 3 delete stays deleted | ✅ end-to-end incl. reopen |
+| **4 tombstone NOT dropped early** | ⚠️ unit-level only, on a synthetic `Compaction`. No `Db`-level version exists *because* it's unreachable (above). The doc calls this "the one that matters most" |
+| **5 crash mid-compaction** | ⚠️ *simulated* — `orphan_compaction_output_is_swept_on_reopen` writes a stray `000999.sst` (`compaction_safety.rs:79`). No real process kill, even though a genuine kill-9 harness already exists (`kill9.rs`). The MANIFEST torn-commit window is untested end-to-end |
+| 6 concurrent reads | ✅ — but **reads only**. No concurrent *writer* test, which is exactly what A3 would expose |
+| 7 leveled invariant | ⛔ N/A until A1 |
+
+### Scale
+
+`run_compaction` fully materializes the merge in RAM: `SstReader::entries()`
+returns a `Vec` per input (`sstable.rs:581`) and the output is
+`Merge::new(..).collect()` (`compaction.rs:99`). `merge.rs`'s own header claims
+the writer "can consume it entry-by-entry without materializing the whole merge
+in RAM" — the *engine* streams, both *ends* don't. At the real 64 MB threshold
+with `min_run: 4`, one compaction peaks around half a gigabyte. Tests never see
+it because they use tiny thresholds.
+
+### Verdict
+
+Phase 5 is **done-when-complete but decision-incomplete**. Nothing here is
+unsafe for a single-threaded embedded user, and Track B does not depend on any
+of it — so proceeding to Phase 6 is fine. Revisit A1+A2 together (they're one
+change), then A3+A4 together, before Phase 10 wires real traffic through.

@@ -27,9 +27,9 @@ Every phase file has the same shape:
 | 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | decisions locked |
 | 3 | [phase-03-sstable.md](phase-03-sstable.md) | Flush to immutable disk file | decisions locked |
 | 4 | [phase-04-bloom.md](phase-04-bloom.md) | Skip files you don't need | decisions locked |
-| 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | decisions locked |
-| 6 | phase-06-raft-single.md | Raft state machine, isolated | todo |
-| 7 | phase-07-election.md | Leader election over RPC | todo |
+| 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | locked; **§8 carry-forward** (leveled + bg thread unshipped) |
+| 6 | [phase-06-raft-single.md](phase-06-raft-single.md) | Raft state machine, isolated | **built** ✅ |
+| 7 | [phase-07-election.md](phase-07-election.md) | Leader election over RPC | **built** ✅ (wire choice provisional — §2) |
 | 8 | phase-08-replication.md | Agree on one ordered log | todo |
 | 9 | phase-09-snapshot.md | Stop the log growing forever | todo |
 | 10 | phase-10-apply-seam.md | Connect Raft `apply` → LSM | todo |
@@ -65,6 +65,19 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Compaction strategy | 5 | size-tiered first, **leveled target** (read-heavy), pluggable | locked |
 | Tombstone GC safety | 5 | drop only at bottom-most level, else carry forward | locked |
 | File-set tracking | 5 | MANIFEST (append-only version edits) | locked |
-| Compaction concurrency | 5 | background thread, Arc'd Version, deferred file delete | locked |
+| Compaction concurrency | 5 | background thread, Arc'd Version, deferred file delete | locked; **bg thread not yet built** (§8 A3) |
+| Raft core style | 6 | deterministic driven core (etcd model) — no timers/goroutines/IO inside | locked |
+| Raft driver contract | 6 | persist+fsync → send → apply → Advance | locked |
+| Raft log indexing | 6 | dummy sentinel {0,0}; access via `Log` methods only | locked |
+| Raft persistence | 6 | own append-only file, Phase-1 framing (len prefix + CRC32C) | locked |
+| Raft log truncation | 6 | `TruncateFrom` via index→offset table (built ph6, used ph8) | locked |
+| Raft apply seam | 6 | `StateMachine{Apply([]byte)}`; opaque command bytes | locked |
+| Real time | 7 | `Server` loop outside `Node`; one goroutine owns the `Driver` | locked |
+| Tick granularity | 7 | 10ms tick; election 15 ticks → [150,300)ms; heartbeat 5 ticks | locked |
+| **Wire format** | 7 | **own TCP + CRC32C frames; gRPC deferred behind `Transport`** | **PROVISIONAL — deviates from ROADMAP, needs sign-off** |
+| Transports | 7 | ship two: deterministic `Loopback`/`Bus` + real `TCPTransport` | locked |
+| Message loss | 7 | fire-and-forget; drop on unreachable, lazy redial, no queue | locked |
+| Heartbeat semantics | 7 | resets election timer even on log mismatch; commit only on match | locked |
+| Seed mixing | 7 | node ID folded into `Config.Seed` so a cluster-wide seed stays replayable *and* independent | locked |
 | Rust ↔ Go boundary | 10 | TBD | open |
 | Read consistency mode | 11 | Leader-only to start | tentative |
