@@ -112,22 +112,43 @@ type Message struct {
 	Granted    bool   // MsgVoteResp
 	Success    bool   // MsgAppResp
 	MatchIndex uint64 // MsgAppResp
+
+	// Rejection hint (Raft §5.3's optimization, Phase 8 §1). A follower that
+	// rejects an AppendEntries reports where the leader should resume, so the
+	// leader skips a whole run of a conflicting term in one hop instead of
+	// backing up one index per round trip.
+	//
+	// ConflictTerm == 0 means "my log is simply too short"; ConflictIndex is
+	// then the follower's lastIndex+1. Otherwise ConflictTerm is the term the
+	// follower holds at prevLogIndex and ConflictIndex is the first index it
+	// holds for that term.
+	//
+	// Both zero means "no hint" — the leader falls back to the paper's linear
+	// decrement, which is always correct. Correctness never depends on the hint.
+	ConflictIndex uint64
+	ConflictTerm  uint64
 }
 
 // Ready is everything the driver must do before the node may take another step.
 //
 // The order is the contract (§2), and it is not negotiable:
 //
+//	truncate TruncateFrom                 (Phase 8)
 //	persist HardState + EntriesToPersist  →  fsync
 //	                                      →  send Messages
 //	                                      →  apply CommittedEntries
 //	                                      →  Advance()
 //
 // Sending before the fsync can promise a vote the node forgets across a crash;
-// applying before the fsync can expose data a future leader overwrites.
+// applying before the fsync can expose data a future leader overwrites;
+// appending before the truncate leaves a crash window exposing the wrong suffix.
 type Ready struct {
 	// HardState is non-nil when currentTerm or votedFor changed.
 	HardState *HardState
+	// TruncateFrom, when non-nil, must be durably applied to stable storage
+	// **before** EntriesToPersist: discard every entry at or after this index.
+	// Set only when a follower found a genuine conflict (Phase 8 §2).
+	TruncateFrom *uint64
 	// EntriesToPersist are new log entries, contiguous and ascending.
 	EntriesToPersist []Entry
 	// Messages must be sent only after the above is durable. Empty in Phase 6.
@@ -139,6 +160,7 @@ type Ready struct {
 // IsEmpty reports whether there is nothing for the driver to do.
 func (r Ready) IsEmpty() bool {
 	return r.HardState == nil &&
+		r.TruncateFrom == nil &&
 		len(r.EntriesToPersist) == 0 &&
 		len(r.Messages) == 0 &&
 		len(r.CommittedEntries) == 0

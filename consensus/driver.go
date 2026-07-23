@@ -73,6 +73,15 @@ func (d *Driver) run() error {
 	}
 
 	// 1. Durable first — always, before anything observable leaves this node.
+	//
+	//    Truncation precedes the append and is not merely stylistic: appending
+	//    first and truncating after leaves a crash window in which the log on
+	//    disk carries the wrong suffix.
+	if rd.TruncateFrom != nil {
+		if err := d.storage.TruncateFrom(*rd.TruncateFrom); err != nil {
+			return err
+		}
+	}
 	if rd.HardState != nil {
 		if err := d.storage.SaveHardState(*rd.HardState); err != nil {
 			return err

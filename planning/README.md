@@ -30,7 +30,7 @@ Every phase file has the same shape:
 | 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | locked; **§8 carry-forward** (leveled + bg thread unshipped) |
 | 6 | [phase-06-raft-single.md](phase-06-raft-single.md) | Raft state machine, isolated | **built** ✅ |
 | 7 | [phase-07-election.md](phase-07-election.md) | Leader election over RPC | **built** ✅ (wire choice provisional — §2) |
-| 8 | phase-08-replication.md | Agree on one ordered log | todo |
+| 8 | [phase-08-replication.md](phase-08-replication.md) | Agree on one ordered log | decisions locked |
 | 9 | phase-09-snapshot.md | Stop the log growing forever | todo |
 | 10 | phase-10-apply-seam.md | Connect Raft `apply` → LSM | todo |
 | 11 | phase-11-client.md | Usable from outside | todo |
@@ -79,5 +79,10 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Message loss | 7 | fire-and-forget; drop on unreachable, lazy redial, no queue | locked |
 | Heartbeat semantics | 7 | resets election timer even on log mismatch; commit only on match | locked |
 | Seed mixing | 7 | node ID folded into `Config.Seed` so a cluster-wide seed stays replayable *and* independent | locked |
+| Divergence repair | 8 | follower-hinted backtracking; linear `nextIndex--` as the correctness fallback | locked |
+| Truncation rule | 8 | truncate only at the first genuinely differing term; `AppendEntries` idempotent | locked |
+| Follower commit bound | 8 | `min(leaderCommit, last new entry)` — fixes Phase 7's `localLastIndex` | locked |
+| `Ready` contract | 8 | gains `TruncateFrom`; order becomes truncate → append → fsync → send → apply | locked |
+| Replication batching | 8 | 64 entries / 1 MiB per `AppendEntries`; send on `Propose`, heartbeats repair | locked |
 | Rust ↔ Go boundary | 10 | TBD | open |
 | Read consistency mode | 11 | Leader-only to start | tentative |

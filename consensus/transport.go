@@ -20,9 +20,10 @@ import (
 //	lastLogIndex(8) lastLogTerm(8)
 //	prevLogIndex(8) prevLogTerm(8) leaderCommit(8)
 //	granted(1) success(1) matchIndex(8)
+//	conflictIndex(8) conflictTerm(8)
 //	entryCount(4) [ term(8) index(8) cmdLen(4) cmd ]*
 
-const msgFixedLen = 1 + 8*3 + 8*2 + 8*3 + 1 + 1 + 8 + 4
+const msgFixedLen = 1 + 8*3 + 8*2 + 8*3 + 1 + 1 + 8 + 8 + 8 + 4
 
 func boolByte(b bool) byte {
 	if b {
@@ -47,7 +48,9 @@ func EncodeMessage(m Message) []byte {
 	payload[65] = boolByte(m.Granted)
 	payload[66] = boolByte(m.Success)
 	le.PutUint64(payload[67:75], m.MatchIndex)
-	le.PutUint32(payload[75:79], uint32(len(m.Entries)))
+	le.PutUint64(payload[75:83], m.ConflictIndex)
+	le.PutUint64(payload[83:91], m.ConflictTerm)
+	le.PutUint32(payload[91:95], uint32(len(m.Entries)))
 
 	for _, e := range m.Entries {
 		var hdr [20]byte
@@ -92,12 +95,14 @@ func DecodeMessage(buf []byte) (Message, int, error) {
 		PrevLogIndex: le.Uint64(p[41:49]),
 		PrevLogTerm:  le.Uint64(p[49:57]),
 		LeaderCommit: le.Uint64(p[57:65]),
-		Granted:      p[65] == 1,
-		Success:      p[66] == 1,
-		MatchIndex:   le.Uint64(p[67:75]),
+		Granted:       p[65] == 1,
+		Success:       p[66] == 1,
+		MatchIndex:    le.Uint64(p[67:75]),
+		ConflictIndex: le.Uint64(p[75:83]),
+		ConflictTerm:  le.Uint64(p[83:91]),
 	}
 
-	count := int(le.Uint32(p[75:79]))
+	count := int(le.Uint32(p[91:95]))
 	off := msgFixedLen
 	for i := 0; i < count; i++ {
 		if off+20 > len(p) {

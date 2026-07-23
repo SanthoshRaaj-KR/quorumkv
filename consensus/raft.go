@@ -32,7 +32,22 @@ type Config struct {
 	// A cluster-wide seed is the intended usage: the node ID is mixed in, so
 	// every node still draws an independent timeout stream (see NewNode).
 	Seed int64
+	// MaxEntriesPerAppend caps how many entries one AppendEntries carries
+	// (default 64). Unbounded batches are not merely slow: ReadMessage refuses
+	// frames over 64 MiB, so a far-behind follower would deadlock its own
+	// catch-up.
+	MaxEntriesPerAppend int
+	// MaxBytesPerAppend caps the same message by size (default 1 MiB). Needed
+	// independently of the entry cap — 64 entries of 1 MiB each would blow the
+	// frame limit on their own.
+	MaxBytesPerAppend int
 }
+
+// Replication batch defaults (planning/phase-08 §4).
+const (
+	DefaultMaxEntriesPerAppend = 64
+	DefaultMaxBytesPerAppend   = 1 << 20
+)
 
 func (c *Config) validate() error {
 	switch {
@@ -95,11 +110,16 @@ type Node struct {
 	heartbeatTimeout int
 	rng              *rand.Rand
 
+	maxEntries int
+	maxBytes   int
+
 	// Accumulated for the next Ready.
-	unstable       []Entry
-	pendingMsgs    []Message
-	hardStateDirty bool
-	mark           readyMark
+	unstable []Entry
+	// pendingTruncate is the lowest index a conflict requires storage to drop.
+	pendingTruncate *uint64
+	pendingMsgs     []Message
+	hardStateDirty  bool
+	mark            readyMark
 }
 
 // readyMark records exactly what the last Ready reported, so Advance consumes
@@ -107,6 +127,7 @@ type Node struct {
 type readyMark struct {
 	active    bool
 	hardState bool
+	truncate  bool
 	entries   int
 	messages  int
 	commit    uint64
@@ -140,6 +161,14 @@ func NewNode(cfg Config) (*Node, error) {
 		seed = 1
 	}
 	seed = seed*2862933555777941757 + int64(cfg.ID)*3037000493
+	maxEntries := cfg.MaxEntriesPerAppend
+	if maxEntries <= 0 {
+		maxEntries = DefaultMaxEntriesPerAppend
+	}
+	maxBytes := cfg.MaxBytesPerAppend
+	if maxBytes <= 0 {
+		maxBytes = DefaultMaxBytesPerAppend
+	}
 	n := &Node{
 		id:               cfg.ID,
 		peers:            append([]uint64(nil), cfg.Peers...),
@@ -153,6 +182,8 @@ func NewNode(cfg Config) (*Node, error) {
 		electionTimeout:  cfg.ElectionTimeout,
 		heartbeatTimeout: cfg.HeartbeatTimeout,
 		rng:              rand.New(rand.NewSource(seed)),
+		maxEntries:       maxEntries,
+		maxBytes:         maxBytes,
 	}
 	n.resetElectionTimer()
 	return n, nil
@@ -238,6 +269,10 @@ func (n *Node) Ready() Ready {
 		hs := HardState{Term: n.currentTerm, VotedFor: n.votedFor}
 		rd.HardState = &hs
 	}
+	if n.pendingTruncate != nil {
+		at := *n.pendingTruncate
+		rd.TruncateFrom = &at
+	}
 	if len(n.unstable) > 0 {
 		rd.EntriesToPersist = append([]Entry(nil), n.unstable...)
 	}
@@ -250,6 +285,7 @@ func (n *Node) Ready() Ready {
 	n.mark = readyMark{
 		active:    true,
 		hardState: rd.HardState != nil,
+		truncate:  rd.TruncateFrom != nil,
 		entries:   len(rd.EntriesToPersist),
 		messages:  len(rd.Messages),
 		commit:    n.commitIndex,
@@ -265,6 +301,9 @@ func (n *Node) Advance() {
 	}
 	if n.mark.hardState {
 		n.hardStateDirty = false
+	}
+	if n.mark.truncate {
+		n.pendingTruncate = nil
 	}
 	n.unstable = n.unstable[n.mark.entries:]
 	n.pendingMsgs = n.pendingMsgs[n.mark.messages:]
@@ -404,41 +443,152 @@ func (n *Node) handleAppendEntries(m Message) {
 	n.leaderID = m.From
 	n.resetElectionTimer()
 
-	match := n.log.Has(m.PrevLogIndex) && n.log.Term(m.PrevLogIndex) == m.PrevLogTerm
-	if match {
-		// Phase 8 appends m.Entries here and truncates any conflicting suffix.
-		if m.LeaderCommit > n.commitIndex {
-			// Never commit past what this node can prove it holds.
-			n.commitIndex = min(m.LeaderCommit, n.log.LastIndex())
+	// ── the log-matching check, with a hint on rejection (§1) ────────────────
+
+	if !n.log.Has(m.PrevLogIndex) {
+		// Too short. Point the leader straight at our end rather than making it
+		// walk backwards one index per round trip.
+		n.send(Message{
+			Type: MsgAppResp, From: n.id, To: m.From, Term: n.currentTerm,
+			Success:       false,
+			ConflictIndex: n.log.LastIndex() + 1,
+			ConflictTerm:  0,
+		})
+		return
+	}
+	if got := n.log.Term(m.PrevLogIndex); got != m.PrevLogTerm {
+		// We have the index but in a different term. Report the first index we
+		// hold for that term, so the leader skips its whole run in one hop.
+		first := m.PrevLogIndex
+		for first > 1 && n.log.Term(first-1) == got {
+			first--
 		}
+		n.send(Message{
+			Type: MsgAppResp, From: n.id, To: m.From, Term: n.currentTerm,
+			Success:       false,
+			ConflictIndex: first,
+			ConflictTerm:  got,
+		})
+		return
 	}
 
-	resp := Message{Type: MsgAppResp, From: n.id, To: m.From, Term: n.currentTerm, Success: match}
-	if match {
-		resp.MatchIndex = m.PrevLogIndex + uint64(len(m.Entries))
+	// ── merge, truncating ONLY at a genuine conflict (§2) ────────────────────
+	//
+	// The naive "truncate at prevLogIndex+1 then append" is wrong and fails
+	// silently: a delayed duplicate of an earlier batch would discard entries
+	// appended since — entries that may already be committed on a majority.
+	// AppendEntries must be idempotent.
+	for i, e := range m.Entries {
+		idx := m.PrevLogIndex + 1 + uint64(i)
+		if n.log.Has(idx) {
+			if n.log.Term(idx) == e.Term {
+				continue // already present: not a conflict, nothing to do
+			}
+			n.truncateFrom(idx) // a real conflict: drop this and everything after
+		}
+		// Trust the computed index over the sender's, so a malformed peer
+		// cannot punch a hole in the log.
+		n.appendUnstable(Entry{Term: e.Term, Index: idx, Cmd: e.Cmd})
 	}
-	n.send(resp)
+
+	// Figure 2: min(leaderCommit, index of last NEW entry) — not the local last
+	// index. A delayed message carrying a stale-but-high leaderCommit must not
+	// commit entries it never covered.
+	lastNew := m.PrevLogIndex + uint64(len(m.Entries))
+	if m.LeaderCommit > n.commitIndex {
+		n.commitIndex = min(m.LeaderCommit, lastNew)
+	}
+
+	n.send(Message{
+		Type: MsgAppResp, From: n.id, To: m.From, Term: n.currentTerm,
+		Success: true, MatchIndex: lastNew,
+	})
+}
+
+// truncateFrom drops the log suffix at or after idx and records the truncation
+// for the driver to apply to stable storage before the next append.
+func (n *Node) truncateFrom(idx uint64) {
+	n.log.TruncateFrom(idx)
+	if n.pendingTruncate == nil || idx < *n.pendingTruncate {
+		at := idx
+		n.pendingTruncate = &at
+	}
+	// Anything already queued for persistence at or after idx is now void.
+	kept := n.unstable[:0]
+	for _, e := range n.unstable {
+		if e.Index < idx {
+			kept = append(kept, e)
+		}
+	}
+	n.unstable = kept
 }
 
 // handleAppendResponse folds a follower's reply into the leader's replication
-// bookkeeping.
-//
-// A *failure* is deliberately ignored in Phase 7: walking nextIndex backward to
-// find the last point of agreement and shipping the missing entries is Phase 8's
-// whole job, and doing half of it here is how the log-matching property gets
-// quietly broken.
+// bookkeeping, and on rejection finds the point of agreement.
 func (n *Node) handleAppendResponse(m Message) {
 	if n.role != Leader || m.Term != n.currentTerm {
 		return
 	}
-	if !m.Success {
-		return // Phase 8: nextIndex backoff.
+
+	if m.Success {
+		// matchIndex is monotonic: a stale, reordered response must never walk
+		// it backwards, which would un-commit an entry.
+		if m.MatchIndex > n.matchIndex[m.From] {
+			n.matchIndex[m.From] = m.MatchIndex
+		}
+		n.nextIndex[m.From] = n.matchIndex[m.From] + 1
+		n.maybeAdvanceCommit()
+		// Keep streaming while this follower is still behind — that is what
+		// makes a 50-entry catch-up finish in a couple of round trips rather
+		// than one heartbeat per batch.
+		if n.nextIndex[m.From] <= n.log.LastIndex() {
+			n.sendAppend(m.From)
+		}
+		return
 	}
-	if m.MatchIndex > n.matchIndex[m.From] {
-		n.matchIndex[m.From] = m.MatchIndex
+
+	// Rejected. Use the follower's hint if it gives real progress; otherwise
+	// fall back to the paper's linear decrement, which is always correct.
+	cur := n.nextIndex[m.From]
+	var next uint64
+	if m.ConflictIndex > 0 {
+		switch {
+		case m.ConflictTerm == 0:
+			next = m.ConflictIndex // follower's log is simply too short
+		default:
+			if last := n.lastIndexOfTerm(m.ConflictTerm); last > 0 {
+				next = last + 1 // skip our whole run of that term
+			} else {
+				next = m.ConflictIndex // we never had that term at all
+			}
+		}
 	}
-	n.nextIndex[m.From] = n.matchIndex[m.From] + 1
-	n.maybeAdvanceCommit()
+	if next == 0 || next >= cur {
+		// No usable hint — decrement, so progress is guaranteed regardless.
+		if cur > 1 {
+			next = cur - 1
+		} else {
+			next = 1
+		}
+	}
+	if next < 1 {
+		next = 1
+	}
+	n.nextIndex[m.From] = next
+	n.sendAppend(m.From)
+}
+
+// lastIndexOfTerm returns the highest index this log holds for term, or 0.
+func (n *Node) lastIndexOfTerm(term uint64) uint64 {
+	for i := n.log.LastIndex(); i >= 1; i-- {
+		switch {
+		case n.log.Term(i) == term:
+			return i
+		case n.log.Term(i) < term:
+			return 0 // terms ascend: we are past it
+		}
+	}
+	return 0
 }
 
 func (n *Node) countVotes() int {
