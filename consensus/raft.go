@@ -215,7 +215,7 @@ func (n *Node) Tick() {
 		n.heartbeatElapsed++
 		if n.heartbeatElapsed >= n.heartbeatTimeout {
 			n.heartbeatElapsed = 0
-			n.broadcastHeartbeat()
+			n.broadcastAppend()
 		}
 		return
 	}
@@ -232,6 +232,9 @@ func (n *Node) Propose(cmd []byte) error {
 	}
 	n.appendEntry(Entry{Term: n.currentTerm, Index: n.log.LastIndex() + 1, Cmd: cmd})
 	n.maybeAdvanceCommit()
+	// Replicate immediately rather than waiting for the next heartbeat: commit
+	// latency becomes one round trip instead of one heartbeat interval (§4).
+	n.broadcastAppend()
 	return nil
 }
 
@@ -381,7 +384,7 @@ func (n *Node) becomeLeader() {
 	// Assert authority immediately rather than waiting a heartbeat interval —
 	// otherwise followers can time out and start a pointless election against a
 	// leader that has already won.
-	n.broadcastHeartbeat()
+	n.broadcastAppend()
 }
 
 func (n *Node) resetElectionTimer() {
@@ -604,9 +607,14 @@ func (n *Node) countVotes() int {
 // ─── log and commit ──────────────────────────────────────────────────────────
 
 func (n *Node) appendEntry(e Entry) {
+	n.appendUnstable(e)
+	n.matchIndex[n.id] = n.log.LastIndex()
+}
+
+// appendUnstable adds an entry to the log and queues it for persistence.
+func (n *Node) appendUnstable(e Entry) {
 	n.log.Append(e)
 	n.unstable = append(n.unstable, e)
-	n.matchIndex[n.id] = n.log.LastIndex()
 }
 
 // maybeAdvanceCommit implements the general commit rule, written now so Phase 8
@@ -642,32 +650,60 @@ func (n *Node) maybeAdvanceCommit() {
 
 func (n *Node) send(m Message) { n.pendingMsgs = append(n.pendingMsgs, m) }
 
-// broadcastHeartbeat is the leader's periodic empty AppendEntries: the thing
-// that keeps followers from timing out. Phase 8 gives it entries to carry.
-func (n *Node) broadcastHeartbeat() {
+// broadcastAppend sends every peer whatever it is currently missing. With a
+// caught-up follower the message carries no entries and is exactly the Phase 7
+// heartbeat; with a lagging one it carries a batch. That is why a restarted
+// follower catches up without any write arriving.
+func (n *Node) broadcastAppend() {
 	for _, p := range n.peers {
 		if p == n.id {
 			continue
 		}
-		// Anchor on nextIndex rather than the leader's own last index, so the
-		// probe already means what Phase 8 needs it to mean.
-		next := n.nextIndex[p]
-		if next < 1 {
-			next = 1
-		}
-		prev := next - 1
-		var prevTerm uint64
-		if n.log.Has(prev) {
-			prevTerm = n.log.Term(prev)
-		}
-		n.send(Message{
-			Type:         MsgAppReq,
-			From:         n.id,
-			To:           p,
-			Term:         n.currentTerm,
-			PrevLogIndex: prev,
-			PrevLogTerm:  prevTerm,
-			LeaderCommit: n.commitIndex,
-		})
+		n.sendAppend(p)
 	}
+}
+
+// sendAppend builds one AppendEntries for peer, anchored at nextIndex-1 and
+// capped by both the entry count and the byte budget (§4).
+func (n *Node) sendAppend(peer uint64) {
+	next := n.nextIndex[peer]
+	if next < 1 {
+		next = 1
+	}
+	prev := next - 1
+
+	if !n.log.Has(prev) {
+		// Only reachable once Phase 9 truncates the log's head, which is exactly
+		// the condition that calls for InstallSnapshot. Fail loudly rather than
+		// silently mis-serve a follower.
+		panic(fmt.Sprintf(
+			"consensus: peer %d needs index %d, compacted away — InstallSnapshot is Phase 9", peer, prev))
+	}
+	prevTerm := n.log.Term(prev)
+
+	var entries []Entry
+	var bytes int
+	for i := next; i <= n.log.LastIndex(); i++ {
+		e := n.log.At(i)
+		size := len(e.Cmd) + 20
+		if len(entries) >= n.maxEntries {
+			break
+		}
+		if len(entries) > 0 && bytes+size > n.maxBytes {
+			break
+		}
+		entries = append(entries, e)
+		bytes += size
+	}
+
+	n.send(Message{
+		Type:         MsgAppReq,
+		From:         n.id,
+		To:           peer,
+		Term:         n.currentTerm,
+		PrevLogIndex: prev,
+		PrevLogTerm:  prevTerm,
+		Entries:      entries,
+		LeaderCommit: n.commitIndex,
+	})
 }

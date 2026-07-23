@@ -270,3 +270,44 @@ flow control beyond the batch caps. No membership change, ever.
 **Milestone: Track B is a working replicated log. It orders and replicates
 opaque commands across a real cluster and never loses a committed one — it just
 doesn't store them anywhere real yet. That is Phase 10.**
+
+---
+
+## 9. Status — shipped
+
+Built and green: **53 Go tests**, `go vet` clean, stable over 5 repeated runs.
+Every §6 case is implemented. Entries now commit, which Phase 7 structurally
+could not do.
+
+Measured, not assumed:
+
+- **Catch-up costs 1 `AppendEntries` for 50 entries.** The §1 hint sends the
+  leader straight to the follower's end and the batch cap carries the rest in
+  one message; linear decrement would have needed ~50 round trips.
+- **Batch caps bind correctly.** With caps of 8 entries / 512 bytes and ~120-byte
+  commands, the largest observed batch was 4 entries / 500 bytes — the *byte*
+  cap binding first, exactly as §4 intended by having two caps.
+
+The three safety invariants now run after **every step** of every cluster test:
+one leader per term, no committed entry ever lost, and the Log Matching Property.
+
+### Two notes for whoever reads this next
+
+- **The batch-cap test was initially vacuous** and had to be rewritten. Proposing
+  with the cluster settled after each write means the follower is never behind,
+  so every `AppendEntries` carried exactly one entry and the cap of 8 was never
+  approached — the test passed while proving nothing. It now crashes a follower
+  first to build a real backlog. Worth remembering for Phase 12: a green test
+  that never reaches its own bound is not evidence.
+- **The §2 rule was verified by mutation.** Replacing the conflict-only
+  truncation with the naive "truncate at `prevLogIndex+1` then append" makes
+  `TestDelayedDuplicateAppendEntriesTruncatesNothing` fail with *"a duplicate
+  AppendEntries truncated from index 1 — committed entries destroyed"*. The test
+  detects the exact bug it exists for.
+
+### Carried forward
+
+`sendAppend` panics if a follower needs an index below the log's first — the
+loud failure §5 asked for. It is unreachable today (nothing truncates the log's
+head) and becomes reachable the moment Phase 9 compacts, which is precisely
+where `InstallSnapshot` plugs in.

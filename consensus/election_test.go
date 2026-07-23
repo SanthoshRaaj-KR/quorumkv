@@ -19,8 +19,12 @@ type cluster struct {
 	cfgs  map[uint64]Config
 	down  map[uint64]bool
 
-	// leaderByTerm enforces the safety invariant after *every* step.
-	leaderByTerm map[uint64]uint64
+	// Safety invariants, all enforced after *every* step (see checkInvariant).
+	leaderByTerm map[uint64]uint64 // at most one leader per term
+	committed    map[uint64]uint64 // index → term, once committed anywhere
+	// appReqs counts AppendEntries delivered per destination, so a test can
+	// assert catch-up takes few round trips rather than one per entry.
+	appReqs map[uint64]int
 }
 
 func newCluster(t *testing.T, n int) *cluster {
@@ -33,6 +37,8 @@ func newCluster(t *testing.T, n int) *cluster {
 		cfgs:         make(map[uint64]Config),
 		down:         make(map[uint64]bool),
 		leaderByTerm: make(map[uint64]uint64),
+		committed:    make(map[uint64]uint64),
+		appReqs:      make(map[uint64]int),
 	}
 	for i := 1; i <= n; i++ {
 		c.ids = append(c.ids, uint64(i))
@@ -86,6 +92,9 @@ func (c *cluster) route() {
 				continue // a crashed node drops what was in flight to it
 			}
 			for _, m := range msgs {
+				if m.Type == MsgAppReq {
+					c.appReqs[id]++
+				}
 				if err := c.nodes[id].Step(m); err != nil {
 					c.t.Fatalf("node %d Step(%v): %v", id, m.Type, err)
 				}
@@ -122,6 +131,102 @@ func (c *cluster) checkInvariant() {
 		}
 		c.leaderByTerm[n.Term()] = id
 	}
+	c.checkCommittedNeverLost()
+	c.checkLogMatching()
+}
+
+// checkCommittedNeverLost is the third done-when of Phase 8, as an invariant:
+// once an index is committed anywhere, no node may ever hold a different entry
+// at that index, and no node that had it may lose it.
+func (c *cluster) checkCommittedNeverLost() {
+	c.t.Helper()
+	// Record everything newly committed.
+	for _, id := range c.ids {
+		if c.down[id] {
+			continue
+		}
+		n := c.node(id)
+		for i := uint64(1); i <= n.CommitIndex(); i++ {
+			term := n.Log().Term(i)
+			if prev, ok := c.committed[i]; ok && prev != term {
+				c.t.Fatalf("committed entry %d changed term %d → %d on node %d", i, prev, term, id)
+			}
+			c.committed[i] = term
+		}
+	}
+	// And nobody may contradict or drop one.
+	for _, id := range c.ids {
+		if c.down[id] {
+			continue
+		}
+		n := c.node(id)
+		for i, term := range c.committed {
+			if !n.Log().Has(i) {
+				continue // not replicated here yet — allowed
+			}
+			if got := n.Log().Term(i); got != term {
+				c.t.Fatalf("node %d holds term %d at committed index %d, want %d", id, got, i, term)
+			}
+		}
+	}
+}
+
+// checkLogMatching asserts Raft's Log Matching Property: if two logs contain an
+// entry with the same index and term, the logs are identical in every preceding
+// entry. Equivalently — once two logs diverge at some index, they may never
+// agree again above it.
+func (c *cluster) checkLogMatching() {
+	c.t.Helper()
+	for ai := 0; ai < len(c.ids); ai++ {
+		for bi := ai + 1; bi < len(c.ids); bi++ {
+			a, b := c.ids[ai], c.ids[bi]
+			if c.down[a] || c.down[b] {
+				continue
+			}
+			la, lb := c.node(a).Log(), c.node(b).Log()
+			limit := min(la.LastIndex(), lb.LastIndex())
+			diverged := uint64(0)
+			for i := uint64(1); i <= limit; i++ {
+				if la.Term(i) != lb.Term(i) {
+					if diverged == 0 {
+						diverged = i
+					}
+					continue
+				}
+				if diverged != 0 {
+					c.t.Fatalf(
+						"log matching violated: nodes %d and %d differ at index %d but agree again at %d",
+						a, b, diverged, i)
+				}
+			}
+		}
+	}
+}
+
+// logsIdentical reports whether every live node holds exactly the same entries.
+func (c *cluster) logsIdentical() bool {
+	var ref []Entry
+	first := true
+	for _, id := range c.ids {
+		if c.down[id] {
+			continue
+		}
+		got := c.node(id).Log().Entries()
+		if first {
+			ref, first = got, false
+			continue
+		}
+		if len(got) != len(ref) {
+			return false
+		}
+		for i := range got {
+			if got[i].Term != ref[i].Term || got[i].Index != ref[i].Index ||
+				string(got[i].Cmd) != string(ref[i].Cmd) {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 func (c *cluster) leaders() []uint64 {

@@ -30,7 +30,7 @@ Every phase file has the same shape:
 | 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | locked; **§8 carry-forward** (leveled + bg thread unshipped) |
 | 6 | [phase-06-raft-single.md](phase-06-raft-single.md) | Raft state machine, isolated | **built** ✅ |
 | 7 | [phase-07-election.md](phase-07-election.md) | Leader election over RPC | **built** ✅ (wire choice provisional — §2) |
-| 8 | [phase-08-replication.md](phase-08-replication.md) | Agree on one ordered log | decisions locked |
+| 8 | [phase-08-replication.md](phase-08-replication.md) | Agree on one ordered log | **built** ✅ |
 | 9 | phase-09-snapshot.md | Stop the log growing forever | todo |
 | 10 | phase-10-apply-seam.md | Connect Raft `apply` → LSM | todo |
 | 11 | phase-11-client.md | Usable from outside | todo |
