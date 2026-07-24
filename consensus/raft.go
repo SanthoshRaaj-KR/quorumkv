@@ -315,6 +315,11 @@ func (n *Node) Ready() Ready {
 		hs := HardState{Term: n.currentTerm, VotedFor: n.votedFor}
 		rd.HardState = &hs
 	}
+	if n.pendingSnapshot != nil {
+		s := *n.pendingSnapshot
+		rd.Snapshot = &s
+		rd.RestoreFromSnapshot = true
+	}
 	if n.pendingTruncate != nil {
 		at := *n.pendingTruncate
 		rd.TruncateFrom = &at
@@ -332,6 +337,7 @@ func (n *Node) Ready() Ready {
 		active:    true,
 		hardState: rd.HardState != nil,
 		truncate:  rd.TruncateFrom != nil,
+		snapshot:  rd.Snapshot != nil,
 		entries:   len(rd.EntriesToPersist),
 		messages:  len(rd.Messages),
 		commit:    n.commitIndex,
@@ -347,6 +353,9 @@ func (n *Node) Advance() {
 	}
 	if n.mark.hardState {
 		n.hardStateDirty = false
+	}
+	if n.mark.snapshot {
+		n.pendingSnapshot = nil
 	}
 	if n.mark.truncate {
 		n.pendingTruncate = nil
@@ -569,6 +578,62 @@ func (n *Node) truncateFrom(idx uint64) {
 	n.unstable = kept
 }
 
+// handleInstallSnapshot processes a leader's InstallSnapshot (Phase 9 §4). It
+// reuses MsgAppResp{Success, MatchIndex} for the ack, so the leader's existing
+// handleAppendResponse advances matchIndex/nextIndex with no new code.
+func (n *Node) handleInstallSnapshot(m Message) {
+	if m.Term < n.currentTerm {
+		// A leader from a dead term. Reply with ours so it steps down.
+		n.send(Message{Type: MsgAppResp, From: n.id, To: m.From, Term: n.currentTerm})
+		return
+	}
+
+	n.role = Follower
+	n.leaderID = m.From
+	n.resetElectionTimer()
+
+	if m.SnapshotIndex <= n.commitIndex {
+		// Idempotence (§4): we already have this state, or newer. Install
+		// nothing, ack with what we actually hold.
+		n.send(Message{
+			Type: MsgAppResp, From: n.id, To: m.From, Term: n.currentTerm,
+			Success: true, MatchIndex: n.commitIndex,
+		})
+		return
+	}
+
+	snap := Snapshot{Index: m.SnapshotIndex, Term: m.SnapshotTerm, Data: m.SnapshotData}
+	// An installed snapshot is authoritative and strictly newer than anything
+	// it replaces — the whole log goes, including any uncommitted tail (§7).
+	n.log.RestoreToSnapshot(snap.Index, snap.Term)
+	n.commitIndex = snap.Index
+	n.lastApplied = snap.Index
+	n.snapshot = &snap
+	// Whatever was queued for persistence belonged to the log this just threw
+	// away. Structurally always empty already (Step is followed by a Ready
+	// before the next Step — see Driver), cleared here for robustness.
+	n.unstable = nil
+	n.pendingTruncate = nil
+	n.pendingSnapshot = &snap
+
+	n.send(Message{
+		Type: MsgAppResp, From: n.id, To: m.From, Term: n.currentTerm,
+		Success: true, MatchIndex: snap.Index,
+	})
+}
+
+// SnapshotTaken tells the node a locally-taken snapshot now covers up to
+// snap.Index, compacting the in-memory log to match. This is driver
+// housekeeping (§3): the driver has already made snap durable and compacted
+// the log file before calling this, so it does not flow through Ready.
+func (n *Node) SnapshotTaken(snap Snapshot) {
+	if snap.Index > n.lastApplied {
+		panic(fmt.Sprintf("consensus: cannot snapshot index %d beyond lastApplied %d", snap.Index, n.lastApplied))
+	}
+	n.log.CompactTo(snap.Index)
+	n.snapshot = &snap
+}
+
 // handleAppendResponse folds a follower's reply into the leader's replication
 // bookkeeping, and on rejection finds the point of agreement.
 func (n *Node) handleAppendResponse(m Message) {
@@ -625,14 +690,25 @@ func (n *Node) handleAppendResponse(m Message) {
 }
 
 // lastIndexOfTerm returns the highest index this log holds for term, or 0.
+//
+// The walk must stop at the log's boundary rather than beneath it (Phase 9
+// §7): once a snapshot exists, index 0 may no longer be a valid Term() call,
+// and the boundary index itself is a legitimate answer (its term is real).
+// Written with an explicit break at the boundary rather than decrementing
+// past it, so this works whether or not the boundary happens to be 0.
 func (n *Node) lastIndexOfTerm(term uint64) uint64 {
-	for i := n.log.LastIndex(); i >= 1; i-- {
+	offset := n.log.Offset()
+	for i := n.log.LastIndex(); i >= offset; {
 		switch {
 		case n.log.Term(i) == term:
 			return i
 		case n.log.Term(i) < term:
 			return 0 // terms ascend: we are past it
 		}
+		if i == offset {
+			break
+		}
+		i--
 	}
 	return 0
 }
@@ -716,11 +792,21 @@ func (n *Node) sendAppend(peer uint64) {
 	prev := next - 1
 
 	if !n.log.Has(prev) {
-		// Only reachable once Phase 9 truncates the log's head, which is exactly
-		// the condition that calls for InstallSnapshot. Fail loudly rather than
-		// silently mis-serve a follower.
-		panic(fmt.Sprintf(
-			"consensus: peer %d needs index %d, compacted away — InstallSnapshot is Phase 9", peer, prev))
+		// The follower needs an index this node has already compacted away.
+		// One MsgSnap replaces potentially thousands of entries (Phase 9 §4).
+		if n.snapshot == nil {
+			// Cannot happen: the log's boundary only ever advances via
+			// SnapshotTaken or RestoreToSnapshot, both of which set
+			// n.snapshot in the same breath. Fail loudly rather than silently
+			// mis-serve a follower.
+			panic(fmt.Sprintf("consensus: peer %d needs compacted index %d but this node holds no snapshot", peer, prev))
+		}
+		snap := *n.snapshot
+		n.send(Message{
+			Type: MsgSnap, From: n.id, To: peer, Term: n.currentTerm,
+			SnapshotIndex: snap.Index, SnapshotTerm: snap.Term, SnapshotData: snap.Data,
+		})
+		return
 	}
 	prevTerm := n.log.Term(prev)
 
