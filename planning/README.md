@@ -35,7 +35,7 @@ Every phase file has the same shape:
 | 10 | [phase-10-apply-seam.md](phase-10-apply-seam.md) | Connect Raft `apply` → LSM | **built** ✅ |
 | 11 | [phase-11-client.md](phase-11-client.md) | Usable from outside | **built** ✅ |
 | 12 | [phase-12-chaos.md](phase-12-chaos.md) | Prove it under failure | **planned** — decisions locked, signed off, not yet built |
-| 13 | [phase-13-fault-injection.md](phase-13-fault-injection.md) | Deterministic storage-level fault injection | planned (drafted ahead of 11/12) |
+| 13 | [phase-13-fault-injection.md](phase-13-fault-injection.md) | Deterministic storage-level fault injection | **built** ✅ (drafted and built ahead of 12) |
 
 ## Decision log
 
@@ -96,3 +96,6 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Disk-full fault injection (item 4) | 12 | `FileSink` trait, scoped to `SstWriter` only — a slice of Phase 13's already-planned seam | locked, signed off |
 | Item 5 (Jepsen-style linearizability) | 12 | out of scope, per ROADMAP's own stretch qualifier | locked, signed off |
 | "Run in CI" | 12 | add `.github/workflows/test.yml` (Go job + Rust job) | locked, signed off |
+| Fault-injection seam shape | 13 | `FileSink` trait (Rust) wraps write+sync only; Go gets a narrower single-call-site mirror (`FileStorage.AppendEntries` only — its one file handle serves too many purposes to wrap wholesale) | locked, built |
+| Fault-injection reproducibility | 13 | every fault is seed-derived; hand-rolled SplitMix64 PRNG on both sides, not the `rand` crate (Windows-gnu linking risk, same class of problem as Phase 10 §1) | locked, built |
+| Fault-injection scenarios | 13 | mid-WAL-append, SSTable temp-write-before-rename, mid-compaction — all three built and tested over 20 seeds each | locked, built |

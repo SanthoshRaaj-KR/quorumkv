@@ -9,6 +9,9 @@
 > `TestReadySequenceIsDeterministic` already gives the Raft layer, extended
 > to file I/O in both tracks.
 
+**Built** ✅ — see §6 for what shipped and where it deviated from this plan
+in small, disclosed ways.
+
 ---
 
 ## 0. The gap, precisely — what already exists and what doesn't
@@ -180,3 +183,87 @@ torn writes are safe, orphaned temp files get swept, compaction never
 corrupts existing data — stop resting on "we tested it once and it passed"
 and start resting on "here's the seed that proves it, and it'll prove it
 again."**
+
+---
+
+## 6. What actually shipped
+
+All three scenarios built and passing (20 seeds each), plus the
+determinism test and a passthrough-is-invisible check (the entire
+pre-existing `cargo test`/`go test` suite — 130+ Rust tests, all of
+`consensus` — still passes unchanged after the seam went in).
+
+| Piece | Where |
+|---|---|
+| `FileSink` trait + `impl FileSink for File` (passthrough) | `storage/src/faultsim.rs` |
+| `FaultSchedule`, `FaultKind::{TornWrite,Fail}`, `CallKind::{Write,Sync}`, `FaultyFile` | `storage/src/faultsim.rs` |
+| `WalWriter::open_with_sink` (alongside unchanged `open`) | `storage/src/wal.rs` |
+| `SstWriter::create_with_sink`, `write_sstable_with_sink` (alongside unchanged `create`/`write_sstable`) | `storage/src/sstable.rs` |
+| `run_compaction_with_sink` (alongside unchanged `run_compaction`) | `storage/src/compaction.rs` |
+| Scenario 1 (mid-WAL-append) + determinism test | `storage/tests/faultsim_wal.rs` |
+| Scenario 2 (SSTable temp-write before rename) | `storage/tests/faultsim_sstable.rs` |
+| Scenario 3 (mid-compaction) | `storage/tests/faultsim_compaction.rs` |
+| Go mirror: `appendFault`, `splitMix64` | `consensus/faultsim.go` |
+| Go mirror's test (scenario 1 + determinism) | `consensus/faultsim_test.go` |
+
+### 6a. No new dependency — hand-rolled PRNG instead of `rand`
+
+`Cargo.toml`'s own comment explains why there are zero dev-dependencies:
+the windows-gnu toolchain on this machine can't link crates that pull in
+`windows-sys` (which `tempfile` does, and which `rand`'s `getrandom` backend
+also does on Windows) — the same class of problem §1 already ruled FFI/gRPC
+out for in Phase 10. Rather than risk it, `faultsim.rs` hand-rolls a
+20-line SplitMix64 PRNG, used only to turn a seed into a reproducible torn
+length. `consensus/faultsim.go` mirrors the identical algorithm, so a
+"same seed, same fault" claim holds using the exact same arithmetic on both
+sides, not just the same intent.
+
+### 6b. The Go mirror is narrower than the Rust seam, by necessity
+
+The plan's §1a design (a `FileSink`-shaped wrapper) fits Rust's
+`WalWriter`/`SstWriter` cleanly because those are **write-only** structs.
+`consensus.FileStorage`'s one log file handle is shared by far more:
+`AppendEntries`, `TruncateFrom`, and `replay`'s own `Seek`/`ReadAt` calls all
+go through the same `*os.File`. Wrapping the whole handle behind an
+interface would mean replicating most of `*os.File`'s surface
+(`Write`/`Sync`/`Truncate`/`Seek`/`ReadAt`/`Close`) — a much larger, riskier
+change than this scenario needs.
+
+Built instead: a single-purpose `appendFault` hook consulted only inside
+`AppendEntries`, added as one new unexported field on `FileStorage` (nil in
+production — `OpenFileStorage` never sets it). It reproduces the same
+"tripped" semantics as Rust's `FaultyFile` (once a fault fires, every
+subsequent call is silently skipped, matching that nothing reaches disk
+after a real crash) but doesn't attempt to fault `TruncateFrom` or the
+snapshot path — scenario 1 (mid-append) is the only one of the three whose
+shape applies to `FileStorage` at all (per §2's own note), so this is the
+one and only call site that needed covering.
+
+### 6c. Phase 12 inherits this seam directly, not a slice of it
+
+Phase 12's plan (`planning/phase-12-chaos.md` §2, written and signed off
+*before* this phase was built) anticipated needing only a narrow slice of
+this — `FileSink` wired into `SstWriter` alone, for the disk-full-
+mid-compaction scenario. Since this phase shipped the full thing first
+(`write_sstable_with_sink` and `run_compaction_with_sink` both exist now),
+Phase 12's item 4 can call `run_compaction_with_sink` directly with a
+`FaultKind::Fail`-on-`Sync` schedule — exactly `storage/tests/
+faultsim_compaction.rs`'s own test, reusable essentially as-is. Nothing
+extra to build there when Phase 12's implementation turn comes.
+
+### 6d. One scope note on scenario 2's test
+
+The plan's scenario 2 describes the crash window in terms of a **flush**
+(`"...the WAL segment it was flushing is not deleted..."`). The shipped
+test exercises the same crash window through `write_sstable_with_sink`
+directly (bypassing `Db::flush`), asserting the property that specifically
+needed a live fault to test: the aborted write leaves no visible `.sst`,
+doesn't touch any already-committed SSTable, and the orphaned `.tmp` sweeps
+cleanly. The WAL-segment-retention half of the same scenario — a flush that
+fails must not delete the WAL segment it was covering — was already proven
+by the existing (static, hand-authored-orphan) test
+`flush.rs::crash_before_rename_recovers_from_wal_and_cleans_tmp`, which
+didn't need this seam and wasn't touched. Threading the fault through
+`Db::flush()`'s public API to unify both halves under one live test is a
+reasonable follow-up, not done here to keep this phase's change to `Db`'s
+public surface at zero.
