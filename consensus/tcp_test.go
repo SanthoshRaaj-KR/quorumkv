@@ -22,6 +22,11 @@ func TestMessageCodecRoundTrips(t *testing.T) {
 				{Term: 5, Index: 5, Cmd: bytes.Repeat([]byte{0x7F}, 3000)},
 			},
 		},
+		{
+			Type: MsgSnap, From: 1, To: 2, Term: 6,
+			SnapshotIndex: 500, SnapshotTerm: 4, SnapshotData: bytes.Repeat([]byte{0xCD}, 4096),
+		},
+		{Type: MsgAppResp, From: 2, To: 1, Term: 6, Success: true, MatchIndex: 500}, // the InstallSnapshot ack
 	}
 
 	for _, want := range cases {
@@ -45,6 +50,9 @@ func messagesEqual(a, b Message) bool {
 		a.PrevLogIndex != b.PrevLogIndex || a.PrevLogTerm != b.PrevLogTerm ||
 		a.LeaderCommit != b.LeaderCommit || a.Granted != b.Granted ||
 		a.Success != b.Success || a.MatchIndex != b.MatchIndex ||
+		a.ConflictIndex != b.ConflictIndex || a.ConflictTerm != b.ConflictTerm ||
+		a.SnapshotIndex != b.SnapshotIndex || a.SnapshotTerm != b.SnapshotTerm ||
+		!bytes.Equal(a.SnapshotData, b.SnapshotData) ||
 		len(a.Entries) != len(b.Entries) {
 		return false
 	}

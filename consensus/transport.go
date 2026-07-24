@@ -21,9 +21,11 @@ import (
 //	prevLogIndex(8) prevLogTerm(8) leaderCommit(8)
 //	granted(1) success(1) matchIndex(8)
 //	conflictIndex(8) conflictTerm(8)
+//	snapshotIndex(8) snapshotTerm(8) snapshotDataLen(4)
 //	entryCount(4) [ term(8) index(8) cmdLen(4) cmd ]*
+//	[ snapshotData ]
 
-const msgFixedLen = 1 + 8*3 + 8*2 + 8*3 + 1 + 1 + 8 + 8 + 8 + 4
+const msgFixedLen = 1 + 8*3 + 8*2 + 8*3 + 1 + 1 + 8 + 8 + 8 + 8 + 8 + 4 + 4
 
 func boolByte(b bool) byte {
 	if b {
@@ -50,7 +52,10 @@ func EncodeMessage(m Message) []byte {
 	le.PutUint64(payload[67:75], m.MatchIndex)
 	le.PutUint64(payload[75:83], m.ConflictIndex)
 	le.PutUint64(payload[83:91], m.ConflictTerm)
-	le.PutUint32(payload[91:95], uint32(len(m.Entries)))
+	le.PutUint64(payload[91:99], m.SnapshotIndex)
+	le.PutUint64(payload[99:107], m.SnapshotTerm)
+	le.PutUint32(payload[107:111], uint32(len(m.SnapshotData)))
+	le.PutUint32(payload[111:115], uint32(len(m.Entries)))
 
 	for _, e := range m.Entries {
 		var hdr [20]byte
@@ -60,6 +65,7 @@ func EncodeMessage(m Message) []byte {
 		payload = append(payload, hdr[:]...)
 		payload = append(payload, e.Cmd...)
 	}
+	payload = append(payload, m.SnapshotData...)
 
 	buf := make([]byte, headerLen+len(payload))
 	le.PutUint32(buf[4:8], uint32(len(payload)))
@@ -100,9 +106,12 @@ func DecodeMessage(buf []byte) (Message, int, error) {
 		MatchIndex:    le.Uint64(p[67:75]),
 		ConflictIndex: le.Uint64(p[75:83]),
 		ConflictTerm:  le.Uint64(p[83:91]),
+		SnapshotIndex: le.Uint64(p[91:99]),
+		SnapshotTerm:  le.Uint64(p[99:107]),
 	}
 
-	count := int(le.Uint32(p[91:95]))
+	snapDataLen := int(le.Uint32(p[107:111]))
+	count := int(le.Uint32(p[111:115]))
 	off := msgFixedLen
 	for i := 0; i < count; i++ {
 		if off+20 > len(p) {
@@ -120,6 +129,13 @@ func DecodeMessage(buf []byte) (Message, int, error) {
 		off += cmdLen
 		m.Entries = append(m.Entries, e)
 	}
+	if off+snapDataLen > len(p) {
+		return Message{}, 0, errors.New("consensus: truncated snapshot data")
+	}
+	if snapDataLen > 0 {
+		m.SnapshotData = append([]byte(nil), p[off:off+snapDataLen]...)
+	}
+	off += snapDataLen
 	if off != len(p) {
 		return Message{}, 0, errors.New("consensus: trailing bytes in message")
 	}

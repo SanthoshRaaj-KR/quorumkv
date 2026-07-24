@@ -41,6 +41,11 @@ type Config struct {
 	// independently of the entry cap — 64 entries of 1 MiB each would blow the
 	// frame limit on their own.
 	MaxBytesPerAppend int
+	// SnapshotThreshold is how many applied entries beyond the last snapshot
+	// trigger a new one (default 10000). Every node snapshots independently on
+	// its own applied state — this is driver housekeeping, not a leader-only
+	// concern (Phase 9 §3).
+	SnapshotThreshold int
 }
 
 // Replication batch defaults (planning/phase-08 §4).
@@ -48,6 +53,10 @@ const (
 	DefaultMaxEntriesPerAppend = 64
 	DefaultMaxBytesPerAppend   = 1 << 20
 )
+
+// DefaultSnapshotThreshold is how many applied entries accumulate beyond the
+// last snapshot before the driver takes another one (Phase 9 §3).
+const DefaultSnapshotThreshold = 10000
 
 func (c *Config) validate() error {
 	switch {
@@ -92,6 +101,12 @@ type Node struct {
 	// Phase 7 so Phase 11's client has something to redirect to.
 	leaderID uint64
 
+	// snapshot is the most recent snapshot this node holds — taken locally or
+	// installed from a leader — kept in RAM so sendAppend can serve it via
+	// MsgSnap without going back to storage (Phase 9 §1; Phase 10 will serve
+	// the bytes from storage instead once they're the LSM's SSTable set).
+	snapshot *Snapshot
+
 	// Volatile — deliberately not persisted (§6).
 	commitIndex uint64
 	lastApplied uint64
@@ -117,6 +132,11 @@ type Node struct {
 	unstable []Entry
 	// pendingTruncate is the lowest index a conflict requires storage to drop.
 	pendingTruncate *uint64
+	// pendingSnapshot is a snapshot installed via Step(MsgSnap) but not yet
+	// durable — surfaced once via Ready.Snapshot, then cleared by Advance.
+	// Local snapshots never touch this: they are driver housekeeping and skip
+	// Ready entirely (Phase 9 §3).
+	pendingSnapshot *Snapshot
 	pendingMsgs     []Message
 	hardStateDirty  bool
 	mark            readyMark
@@ -128,6 +148,7 @@ type readyMark struct {
 	active    bool
 	hardState bool
 	truncate  bool
+	snapshot  bool
 	entries   int
 	messages  int
 	commit    uint64
@@ -149,6 +170,20 @@ func NewNode(cfg Config) (*Node, error) {
 	persisted, err := cfg.Storage.LoadEntries()
 	if err != nil {
 		return nil, err
+	}
+	snap, hasSnap, err := cfg.Storage.LoadSnapshot()
+	if err != nil {
+		return nil, err
+	}
+	// A snapshot's boundary becomes the log's new sentinel, and everything it
+	// covers is by definition already committed and applied — commitIndex and
+	// lastApplied restart from there, not 0 (Phase 9 §5, refining the Phase 6
+	// volatile-commit rule).
+	boundary := Entry{}
+	var commitIndex, lastApplied uint64
+	if hasSnap {
+		boundary = Entry{Index: snap.Index, Term: snap.Term}
+		commitIndex, lastApplied = snap.Index, snap.Index
 	}
 	// Mix the node ID into the seed. Randomized election timeouts only break a
 	// vote split if the nodes draw *different* values — and a chaos harness
@@ -175,7 +210,9 @@ func NewNode(cfg Config) (*Node, error) {
 		role:             Follower,
 		currentTerm:      hs.Term,
 		votedFor:         hs.VotedFor,
-		log:              NewLog(persisted),
+		log:              NewLog(boundary, persisted),
+		commitIndex:      commitIndex,
+		lastApplied:      lastApplied,
 		nextIndex:        make(map[uint64]uint64),
 		matchIndex:       make(map[uint64]uint64),
 		votes:            make(map[uint64]bool),
@@ -184,6 +221,10 @@ func NewNode(cfg Config) (*Node, error) {
 		rng:              rand.New(rand.NewSource(seed)),
 		maxEntries:       maxEntries,
 		maxBytes:         maxBytes,
+	}
+	if hasSnap {
+		s := snap
+		n.snapshot = &s
 	}
 	n.resetElectionTimer()
 	return n, nil
@@ -258,6 +299,8 @@ func (n *Node) Step(m Message) error {
 		n.handleAppendEntries(m)
 	case MsgAppResp:
 		n.handleAppendResponse(m)
+	case MsgSnap:
+		n.handleInstallSnapshot(m)
 	default:
 		return fmt.Errorf("consensus: unknown message type %d", m.Type)
 	}
