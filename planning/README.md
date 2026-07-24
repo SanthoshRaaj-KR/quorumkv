@@ -34,7 +34,7 @@ Every phase file has the same shape:
 | 9 | phase-09-snapshot.md | Stop the log growing forever | **built** ✅ |
 | 10 | [phase-10-apply-seam.md](phase-10-apply-seam.md) | Connect Raft `apply` → LSM | **built** ✅ |
 | 11 | [phase-11-client.md](phase-11-client.md) | Usable from outside | **built** ✅ |
-| 12 | phase-12-chaos.md | Prove it under failure | todo |
+| 12 | [phase-12-chaos.md](phase-12-chaos.md) | Prove it under failure | **planned** — decisions locked, signed off, not yet built |
 | 13 | [phase-13-fault-injection.md](phase-13-fault-injection.md) | Deterministic storage-level fault injection | planned (drafted ahead of 11/12) |
 
 ## Decision log
@@ -91,3 +91,8 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Client wire protocol | 11 | hand-rolled HTTP/1.1 subset, JSON — same fork as phase 10's sidecar, applied one layer out | locked, signed off |
 | Write acknowledgment | 11 | new `Server.ProposeAndWait`, resolves on `LastApplied` reaching `(index,term)`; term mismatch → new `ErrProposalLost` | locked, signed off |
 | Read consistency mode | 11 | Leader-only, no confirmation | locked |
+| Chaos test level (items 1–3) | 12 | `consensus`-level, real TCP + real `clientrpc.Client`, stub SM | locked |
+| Partition primitive | 12 | new `TCPTransport.Isolate()`/`Heal()`, promoted from Phase 11's test-only mechanism | locked, signed off |
+| Disk-full fault injection (item 4) | 12 | `FileSink` trait, scoped to `SstWriter` only — a slice of Phase 13's already-planned seam | locked, signed off |
+| Item 5 (Jepsen-style linearizability) | 12 | out of scope, per ROADMAP's own stretch qualifier | locked, signed off |
+| "Run in CI" | 12 | add `.github/workflows/test.yml` (Go job + Rust job) | locked, signed off |
