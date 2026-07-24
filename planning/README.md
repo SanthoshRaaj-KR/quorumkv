@@ -33,7 +33,7 @@ Every phase file has the same shape:
 | 8 | [phase-08-replication.md](phase-08-replication.md) | Agree on one ordered log | **built** ✅ |
 | 9 | phase-09-snapshot.md | Stop the log growing forever | **built** ✅ |
 | 10 | [phase-10-apply-seam.md](phase-10-apply-seam.md) | Connect Raft `apply` → LSM | **built** ✅ |
-| 11 | [phase-11-client.md](phase-11-client.md) | Usable from outside | **planned** — decisions drafted, pending sign-off, not yet built |
+| 11 | [phase-11-client.md](phase-11-client.md) | Usable from outside | **built** ✅ |
 | 12 | phase-12-chaos.md | Prove it under failure | todo |
 | 13 | [phase-13-fault-injection.md](phase-13-fault-injection.md) | Deterministic storage-level fault injection | planned (drafted ahead of 11/12) |
 

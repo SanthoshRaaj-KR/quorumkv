@@ -189,9 +189,9 @@ Algorithm, identical for all three operations:
    - **`leaderId == 0`** (election in progress) **or a network error**
      (node down/unreachable) → the node we asked isn't useful right now; move
      to the next id in `addrs` (wrapping), after a short backoff, and retry.
-3. Cap total attempts (e.g. `2 * len(addrs)`, so every node gets a second
-   look after a full round in case an election resolved mid-loop) before
-   giving up with a "no leader found" error.
+3. Cap total attempts (implemented as `6 * len(addrs)`, so a real election —
+   a couple of election-timeout windows — resolves inside the retry budget
+   before giving up with a "no leader found" error).
 
 This is the whole of `ROADMAP.md`'s done-when: *"a client keeps working
 through a leader election without the caller writing any retry logic
