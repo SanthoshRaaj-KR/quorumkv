@@ -205,16 +205,26 @@ func (r Ready) IsEmpty() bool {
 //
 // Apply must be idempotent — see the note on [HardState]. Snapshot and Restore
 // keep Raft opaque to what the bytes mean (§1): the test SM serializes a
-// slice, the LSM will hand back a reference to its current SSTable set.
+// slice, the LSM hands back its packaged SSTable set (phase-10 §6a).
+//
+// All three methods are fallible (phase-10 §2): Phase 6-9's stubs could never
+// fail, so the interface didn't need to say what happens when they do. A real
+// engine can — a sidecar unreachable, a full disk, a corrupt snapshot blob —
+// and every other durable operation in [Driver.run] already treats failure as
+// fatal and bubbles it (SaveHardState, AppendEntries, TruncateFrom,
+// SaveSnapshot, CompactLog). These three were the only ones that couldn't
+// join that discipline; now they do. A failed Apply must never be silently
+// dropped — that would lose a majority-committed write — so it surfaces the
+// same way a failed fsync does: loudly, stopping the node.
 type StateMachine interface {
-	Apply(cmd []byte)
+	Apply(cmd []byte) error
 	// Snapshot captures applied state as an opaque blob, for the driver to
 	// persist and, later, ship to a lagging follower via InstallSnapshot.
-	Snapshot() []byte
+	Snapshot() ([]byte, error)
 	// Restore replaces the state machine's state with a snapshot previously
 	// returned by Snapshot — either this node's own or one installed from a
 	// leader.
-	Restore(data []byte)
+	Restore(data []byte) error
 }
 
 // Transport delivers outbound messages to peers. Phase 6 has no peers, so a nil

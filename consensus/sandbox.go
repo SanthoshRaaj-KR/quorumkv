@@ -12,16 +12,25 @@ import (
 // reusing the exact same Node/Driver/Bus code every test in this package
 // exercises. Safe for concurrent use — every method takes an internal lock,
 // since an HTTP server (its only caller today) handles requests concurrently.
+//
+// Sandbox is deliberately StateMachine-agnostic (SandboxConfig.NewStateMachine):
+// it cannot import consensus/engine to wire up the real Rust sidecar itself —
+// that package imports consensus for [StateMachine] and [Driver], so consensus
+// importing it back would be a cycle. This is the same "consensus stays
+// ignorant of the LSM" rule as everywhere else (consensus/state.go's own
+// package doc), just enforced by the compiler instead of by convention. The
+// caller that *can* see both packages (consensus/cmd/dashboard-backend) is
+// where a real per-node sidecar process gets spawned and wired in.
 type Sandbox struct {
 	mu      sync.Mutex
 	bus     *Bus
 	ids     []uint64
 	cfgs    map[uint64]Config
+	newSM   func(id uint64) (StateMachine, error)
 	drivers map[uint64]*Driver
-	sms     map[uint64]*sandboxSM
 	down    map[uint64]bool // crashed: stopped ticking, bus-isolated
 
-	traceMu sync.Mutex
+	traceMu  sync.Mutex
 	traceSeq int
 	trace    []TraceEvent
 }
@@ -34,6 +43,11 @@ type SandboxConfig struct {
 	HeartbeatTimeout  int
 	SnapshotThreshold int
 	Seed              int64
+	// NewStateMachine builds the StateMachine for node id — called once at
+	// construction and again on every Restart. nil defaults to an in-memory
+	// stub (sandboxSM) that just remembers strings, for a plain demo/test
+	// with no real engine behind it.
+	NewStateMachine func(id uint64) (StateMachine, error)
 }
 
 // sandboxSM is the Sandbox's StateMachine: it just remembers what it was
@@ -41,18 +55,21 @@ type SandboxConfig struct {
 // Sandbox methods, which already hold sb.mu, so it needs no lock of its own.
 type sandboxSM struct{ applied [][]byte }
 
-func (s *sandboxSM) Apply(cmd []byte) { s.applied = append(s.applied, append([]byte(nil), cmd...)) }
+func (s *sandboxSM) Apply(cmd []byte) error {
+	s.applied = append(s.applied, append([]byte(nil), cmd...))
+	return nil
+}
 
-func (s *sandboxSM) Snapshot() []byte {
+func (s *sandboxSM) Snapshot() ([]byte, error) {
 	var buf []byte
 	for _, cmd := range s.applied {
 		buf = append(buf, byte(len(cmd)), byte(len(cmd)>>8), byte(len(cmd)>>16), byte(len(cmd)>>24))
 		buf = append(buf, cmd...)
 	}
-	return buf
+	return buf, nil
 }
 
-func (s *sandboxSM) Restore(data []byte) {
+func (s *sandboxSM) Restore(data []byte) error {
 	applied := make([][]byte, 0)
 	for len(data) >= 4 {
 		n := int(data[0]) | int(data[1])<<8 | int(data[2])<<16 | int(data[3])<<24
@@ -64,14 +81,7 @@ func (s *sandboxSM) Restore(data []byte) {
 		data = data[n:]
 	}
 	s.applied = applied
-}
-
-func (s *sandboxSM) strings() []string {
-	out := make([]string, len(s.applied))
-	for i, c := range s.applied {
-		out[i] = string(c)
-	}
-	return out
+	return nil
 }
 
 // TraceEvent is one message actually delivered on the bus, recorded for the
@@ -86,14 +96,26 @@ type TraceEvent struct {
 }
 
 // SandboxEntry is one log entry as reported to the dashboard.
+//
+// Cmd is the raw command bytes — a []byte rather than a string deliberately:
+// once real engine.Command encoding flows through here, the bytes are binary,
+// and Go's encoding/json would silently mangle a string field holding
+// non-UTF8 bytes (each invalid byte becomes U+FFFD, irreversibly). []byte
+// gets Go's built-in base64 JSON encoding instead, which round-trips any
+// content intact. A caller that knows the shape (consensus/engine) decodes
+// it further for display; Sandbox itself stays agnostic.
 type SandboxEntry struct {
 	Index uint64 `json:"index"`
 	Term  uint64 `json:"term"`
-	Cmd   string `json:"cmd"`
+	Cmd   []byte `json:"cmd"`
 	NoOp  bool   `json:"noOp"`
 }
 
-// SandboxNodeState is one node's full observable state.
+// SandboxNodeState is one node's full observable Raft-level state. Engine
+// data (what a node's state machine actually holds) is deliberately not
+// here — Sandbox is StateMachine-agnostic, and reads bypass Raft entirely
+// anyway (phase-10 §4); a caller that wired up a real engine reads it
+// directly, in parallel with Sandbox, not through this struct.
 type SandboxNodeState struct {
 	ID          uint64         `json:"id"`
 	Role        string         `json:"role"`
@@ -105,7 +127,6 @@ type SandboxNodeState struct {
 	Offset      uint64         `json:"offset"` // the snapshot boundary, 0 if none yet
 	Down        bool           `json:"down"`
 	Isolated    bool           `json:"isolated"`
-	Applied     []string       `json:"applied"`
 	Entries     []SandboxEntry `json:"entries"`
 }
 
@@ -133,6 +154,11 @@ func NewSandbox(cfg SandboxConfig) (*Sandbox, error) {
 		cfg.HeartbeatTimeout = DefaultHeartbeatTimeout
 	}
 
+	newSM := cfg.NewStateMachine
+	if newSM == nil {
+		newSM = func(uint64) (StateMachine, error) { return &sandboxSM{}, nil }
+	}
+
 	peers := make([]uint64, cfg.Nodes)
 	for i := range peers {
 		peers[i] = uint64(i + 1)
@@ -141,8 +167,8 @@ func NewSandbox(cfg SandboxConfig) (*Sandbox, error) {
 	sb := &Sandbox{
 		bus:     NewBus(),
 		cfgs:    make(map[uint64]Config, cfg.Nodes),
+		newSM:   newSM,
 		drivers: make(map[uint64]*Driver, cfg.Nodes),
-		sms:     make(map[uint64]*sandboxSM, cfg.Nodes),
 		down:    make(map[uint64]bool, cfg.Nodes),
 	}
 	sb.bus.OnMessage = sb.recordTrace
@@ -157,7 +183,10 @@ func NewSandbox(cfg SandboxConfig) (*Sandbox, error) {
 			Seed:              cfg.Seed,
 			SnapshotThreshold: cfg.SnapshotThreshold,
 		}
-		sm := &sandboxSM{}
+		sm, err := newSM(id)
+		if err != nil {
+			return nil, fmt.Errorf("consensus: sandbox node %d: build state machine: %w", id, err)
+		}
 		d, err := NewDriver(nodeCfg, sm, sb.bus.Transport(id))
 		if err != nil {
 			return nil, fmt.Errorf("consensus: sandbox node %d: %w", id, err)
@@ -165,7 +194,6 @@ func NewSandbox(cfg SandboxConfig) (*Sandbox, error) {
 		sb.ids = append(sb.ids, id)
 		sb.cfgs[id] = nodeCfg
 		sb.drivers[id] = d
-		sb.sms[id] = sm
 	}
 	return sb, nil
 }
@@ -285,13 +313,18 @@ func (sb *Sandbox) Restart(id uint64) error {
 	if !ok {
 		return fmt.Errorf("no such node %d", id)
 	}
-	sm := &sandboxSM{}
+	// Rebuilt via the factory, not reused — a real engine's StateMachine may
+	// need to point at a freshly-respawned sidecar with a different address,
+	// which only the caller managing that sidecar's lifecycle knows about.
+	sm, err := sb.newSM(id)
+	if err != nil {
+		return fmt.Errorf("consensus: sandbox node %d: build state machine: %w", id, err)
+	}
 	d, err := NewDriver(cfg, sm, sb.bus.Transport(id))
 	if err != nil {
 		return err
 	}
 	sb.drivers[id] = d
-	sb.sms[id] = sm
 	sb.down[id] = false
 	sb.bus.Heal(id)
 	sb.pumpLocked()
@@ -338,7 +371,7 @@ func (sb *Sandbox) State() SandboxState {
 
 		entries := make([]SandboxEntry, 0, len(real))
 		for _, e := range real {
-			entries = append(entries, SandboxEntry{Index: e.Index, Term: e.Term, Cmd: string(e.Cmd), NoOp: e.IsNoOp()})
+			entries = append(entries, SandboxEntry{Index: e.Index, Term: e.Term, Cmd: e.Cmd, NoOp: e.IsNoOp()})
 		}
 
 		nodes = append(nodes, SandboxNodeState{
@@ -352,7 +385,6 @@ func (sb *Sandbox) State() SandboxState {
 			Offset:      log.Offset(),
 			Down:        sb.down[id],
 			Isolated:    sb.bus.IsIsolated(id),
-			Applied:     sb.sms[id].strings(),
 			Entries:     entries,
 		})
 	}

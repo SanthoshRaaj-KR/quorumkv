@@ -73,12 +73,29 @@ function renderNode(n) {
       <thead><tr><th>idx</th><th>term</th><th>cmd</th></tr></thead>
       <tbody>${entriesHtml || '<tr><td colspan="3" class="empty">nothing above the boundary</td></tr>'}</tbody>
     </table>
-    <div class="applied"><strong>applied:</strong> ${n.applied.length ? n.applied.map(escapeHtml).join(", ") : "<em>none</em>"}</div>
+
+    <div class="engine-box">
+      <div class="engine-box-title">propose (real LSM engine via its sidecar)</div>
+      <input type="text" class="key-input" placeholder="key">
+      <input type="text" class="value-input" placeholder="value (blank + delete = tombstone)">
+      <div class="node-actions">
+        <button onclick="doPropose(${n.id}, this, 'put')">Put</button>
+        <button onclick="doPropose(${n.id}, this, 'delete')">Delete</button>
+      </div>
+    </div>
+
+    <div class="engine-box">
+      <div class="engine-box-title">get <span class="hint">(reads this node's local engine directly — bypasses Raft, can lag a follower)</span></div>
+      <input type="text" class="get-key-input" placeholder="key">
+      <div class="node-actions">
+        <button onclick="doGet(${n.id}, this)">Get</button>
+      </div>
+      <div class="get-result" id="get-result-${n.id}"></div>
+    </div>
+
     <div class="node-actions">
-      <input type="text" class="cmd-input" placeholder="command text (blank = auto)">
-      <button onclick="doPropose(${n.id}, this)">Propose</button>
-      <button onclick="doAction('crash', ${n.id})" title="kill -9: stops ticking, drops in-flight messages">Crash</button>
-      <button onclick="doAction('restart', ${n.id})" title="reload from this node's (in-memory) storage">Restart</button>
+      <button onclick="doAction('crash', ${n.id})" title="kill -9: stops ticking, drops in-flight messages, kills its sidecar too">Crash</button>
+      <button onclick="doAction('restart', ${n.id})" title="respawns its sidecar over the same directory, then rebuilds the Raft driver">Restart</button>
       <button onclick="doAction('isolate', ${n.id})" title="partition: keeps ticking, but no message crosses">Partition</button>
       <button onclick="doAction('heal', ${n.id})">Heal</button>
     </div>
@@ -90,12 +107,37 @@ function renderTraceRow(ev) {
   return `<div class="trace-row"><span class="trace-seq">#${ev.seq}</span><span class="trace-type">${ev.type}</span>${ev.from} → ${ev.to}<span class="trace-detail">${escapeHtml(ev.detail)}</span></div>`;
 }
 
-async function doPropose(id, btn) {
-  const input = btn.parentElement.querySelector(".cmd-input");
-  const cmd = input.value.trim() || `cmd-${Date.now() % 100000}`;
-  await post("/propose", { node: id, cmd });
-  input.value = "";
+async function doPropose(id, btn, op) {
+  const card = btn.closest(".node-card");
+  const key = card.querySelector(".key-input").value;
+  const value = card.querySelector(".value-input").value;
+  if (!key) {
+    alert("key is required");
+    return;
+  }
+  const data = await post("/propose", { node: id, op, key, value });
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
   refresh();
+}
+
+async function doGet(id, btn) {
+  const card = btn.closest(".node-card");
+  const key = card.querySelector(".get-key-input").value;
+  const resultEl = document.getElementById("get-result-" + id);
+  if (!key) {
+    resultEl.textContent = "key is required";
+    return;
+  }
+  resultEl.textContent = "…";
+  const data = await post("/get", { node: id, key });
+  if (data.error) {
+    resultEl.innerHTML = `<span class="get-error">${escapeHtml(data.error)}</span>`;
+    return;
+  }
+  resultEl.textContent = data.found ? `"${data.value}"` : "(absent)";
 }
 
 async function doAction(action, id) {

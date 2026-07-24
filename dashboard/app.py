@@ -418,7 +418,7 @@ def sandbox_tick():
 
 @app.route("/api/sandbox/<action>", methods=["POST"])
 def sandbox_action(action: str):
-    if action not in {"propose", "crash", "restart", "isolate", "heal"}:
+    if action not in {"propose", "get", "crash", "restart", "isolate", "heal"}:
         return jsonify({"error": f"unknown sandbox action {action!r}"}), 404
     data, status = _sandbox_request(f"/{action}", request.get_json(silent=True) or {})
     return jsonify(data), status

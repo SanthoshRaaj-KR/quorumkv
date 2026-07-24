@@ -51,7 +51,9 @@ func NewDriver(cfg Config, sm StateMachine, tr Transport) (*Driver, error) {
 		return nil, err
 	} else if ok {
 		d.lastSnapshotIndex = snap.Index
-		sm.Restore(snap.Data)
+		if err := sm.Restore(snap.Data); err != nil {
+			return nil, err
+		}
 	}
 
 	// A freshly restored node may already owe work (a reloaded HardState is not
@@ -119,7 +121,9 @@ func (d *Driver) run() error {
 			return err
 		}
 		if rd.RestoreFromSnapshot {
-			d.sm.Restore(rd.Snapshot.Data)
+			if err := d.sm.Restore(rd.Snapshot.Data); err != nil {
+				return err
+			}
 		}
 		d.lastSnapshotIndex = rd.Snapshot.Index
 	}
@@ -152,11 +156,16 @@ func (d *Driver) run() error {
 
 	// 3. Apply. The election no-op is a real committed entry but carries no
 	//    command, so it advances lastApplied without reaching the state machine.
+	//    A failed Apply is fatal, not swallowed: silently continuing would mean
+	//    a majority-committed write never lands on this node's engine with no
+	//    trace of the failure (phase-10 §2).
 	for _, e := range rd.CommittedEntries {
 		if e.IsNoOp() {
 			continue
 		}
-		d.sm.Apply(e.Cmd)
+		if err := d.sm.Apply(e.Cmd); err != nil {
+			return err
+		}
 	}
 
 	d.node.Advance()
@@ -181,10 +190,14 @@ func (d *Driver) maybeSnapshot() error {
 		return nil
 	}
 
+	data, err := d.sm.Snapshot()
+	if err != nil {
+		return err
+	}
 	snap := Snapshot{
 		Index: applied,
 		Term:  d.node.Log().Term(applied),
-		Data:  d.sm.Snapshot(),
+		Data:  data,
 	}
 	if err := d.storage.SaveSnapshot(snap); err != nil {
 		return err

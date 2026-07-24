@@ -16,6 +16,7 @@ pub mod logger;
 pub mod manifest;
 pub mod memtable;
 pub mod merge;
+pub mod snapshot;
 pub mod sstable;
 pub mod wal;
 

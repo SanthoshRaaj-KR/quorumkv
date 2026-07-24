@@ -16,21 +16,23 @@ import (
 	"quorumkv/consensus"
 )
 
-// printer is the Phase 6 state machine: commands go to stdout. Phase 10 swaps
-// the Rust LSM engine in behind this same interface.
+// printer is the Phase 6 state machine: commands go to stdout. The real
+// engine (consensus/engine.StateMachine, Phase 10) swaps in behind this same
+// interface for anything that isn't this stdout demo.
 type printer struct{ session int }
 
-func (p *printer) Apply(cmd []byte) {
+func (p *printer) Apply(cmd []byte) error {
 	fmt.Printf("  [session %d] apply: %s\n", p.session, cmd)
+	return nil
 }
 
 // Snapshot/Restore (Phase 9): the demo never accumulates enough entries to
-// trigger one, but the interface still has to be satisfied. Phase 10 replaces
-// this whole type with the Rust LSM engine, which hands back its SSTable set.
-func (p *printer) Snapshot() []byte { return []byte(fmt.Sprintf("session-%d", p.session)) }
+// trigger one, but the interface still has to be satisfied.
+func (p *printer) Snapshot() ([]byte, error) { return []byte(fmt.Sprintf("session-%d", p.session)), nil }
 
-func (p *printer) Restore(data []byte) {
+func (p *printer) Restore(data []byte) error {
 	fmt.Printf("  [session %d] restore: %s\n", p.session, data)
+	return nil
 }
 
 func main() {

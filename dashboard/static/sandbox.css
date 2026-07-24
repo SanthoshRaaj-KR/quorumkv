@@ -123,8 +123,8 @@ table.entries .empty { color: var(--muted); font-style: italic; text-align: cent
   padding: 0.25rem 0.5rem;
 }
 
-.cmd-input {
-  flex: 1 1 100%;
+.key-input, .value-input, .get-key-input {
+  width: 100%;
   padding: 0.3rem 0.4rem;
   border-radius: 4px;
   border: 1px solid var(--border);
@@ -132,7 +132,29 @@ table.entries .empty { color: var(--muted); font-style: italic; text-align: cent
   color: var(--text);
   font-size: 0.8rem;
   margin-bottom: 0.3rem;
+  box-sizing: border-box;
 }
+
+.engine-box {
+  border-top: 1px solid var(--border);
+  padding-top: 0.5rem;
+  margin-top: 0.5rem;
+}
+
+.engine-box-title {
+  font-size: 0.75rem;
+  color: var(--muted);
+  margin-bottom: 0.3rem;
+}
+
+.get-result {
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 0.8rem;
+  margin-top: 0.3rem;
+  min-height: 1.2em;
+}
+
+.get-error { color: var(--fail); }
 
 .trace-panel {
   background: var(--panel);

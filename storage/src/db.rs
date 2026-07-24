@@ -262,6 +262,41 @@ impl Db {
         self.versions.current().files.len()
     }
 
+    /// Package the current live SSTable set as one transferable blob
+    /// (phase-10 §6a) — the Raft snapshot payload. Nothing is re-serialized:
+    /// these files are already immutable and already on disk. Named
+    /// `snapshot_blob` rather than `snapshot` — that name is already the
+    /// private read-tier-snapshot helper below.
+    ///
+    /// Flushes first. A snapshot must capture *everything applied*, not just
+    /// what happened to already be flushed — the live SSTable set alone would
+    /// silently miss whatever sits in the active memtable at the moment this
+    /// is called, which is exactly the kind of gap that stays invisible until
+    /// the one restore that needed it comes up short.
+    pub fn snapshot_blob(&self) -> io::Result<Vec<u8>> {
+        self.flush()?;
+        crate::snapshot::pack(&self.dir, &self.versions.current().file_numbers())
+    }
+
+    /// Rebuild a store at `dir` from a blob produced by [`Db::snapshot`].
+    ///
+    /// An installed snapshot is authoritative over anything already at `dir`
+    /// — the same "always discard, never merge" rule Raft's own
+    /// `Log.RestoreToSnapshot` enforces — so this wipes `dir` first. It then
+    /// writes the packed SSTables and opens normally: a fresh directory with
+    /// SSTables but no MANIFEST is exactly the pre-Phase-5 shape [`Db::open`]
+    /// already knows how to adopt (as one level-0 version), so restore reuses
+    /// that path instead of duplicating MANIFEST-writing logic.
+    pub fn restore(dir: impl AsRef<Path>, blob: &[u8]) -> io::Result<Db> {
+        let dir = dir.as_ref();
+        if dir.exists() {
+            fs::remove_dir_all(dir)?;
+        }
+        fs::create_dir_all(dir)?;
+        crate::snapshot::unpack(dir, blob)?;
+        Db::open(dir)
+    }
+
     /// Total data-block reads across all live SSTables (metrics/tests).
     pub fn sstable_block_reads(&self) -> u64 {
         self.snapshot().2.iter().map(|s| s.block_reads()).sum()
@@ -574,5 +609,87 @@ mod tests {
         assert!(db.sstable_count() < 5, "compaction should reduce the file count");
         assert_eq!(db.get(b"k").unwrap(), Some(b"v4".to_vec())); // newest survives
         assert_eq!(db.len().unwrap(), 1);
+    }
+
+    // ── Phase 10 §6a: snapshot_blob / restore ────────────────────────────────
+
+    #[test]
+    fn snapshot_blob_restores_into_a_fresh_directory_with_identical_reads() {
+        let src_dir = TempDir::new();
+        let dst_dir = TempDir::new();
+        let blob = {
+            let db = open(&src_dir);
+            for i in 0..50u32 {
+                db.put(format!("k{i:03}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            }
+            db.delete(b"k010").unwrap();
+            db.flush().unwrap(); // force real SSTables, not just an in-memory memtable
+            db.snapshot_blob().unwrap()
+        };
+
+        let restored = Db::restore(&dst_dir.0, &blob).unwrap();
+        assert_eq!(restored.len().unwrap(), 49);
+        assert_eq!(restored.get(b"k000").unwrap(), Some(b"v0".to_vec()));
+        assert_eq!(restored.get(b"k049").unwrap(), Some(b"v49".to_vec()));
+        assert_eq!(restored.get(b"k010").unwrap(), None); // the delete survived the snapshot too
+    }
+
+    #[test]
+    fn restore_wipes_whatever_the_target_directory_already_held() {
+        // An installed snapshot is authoritative — stale local state must not
+        // survive alongside it (phase-10 §6a, mirroring Log.RestoreToSnapshot).
+        let dir = TempDir::new();
+        {
+            let stale = open(&dir);
+            stale.put(b"stale-key", b"stale-value").unwrap();
+            stale.flush().unwrap();
+        }
+
+        let src_dir = TempDir::new();
+        let blob = {
+            let db = open(&src_dir);
+            db.put(b"fresh-key", b"fresh-value").unwrap();
+            db.flush().unwrap();
+            db.snapshot_blob().unwrap()
+        };
+
+        let restored = Db::restore(&dir.0, &blob).unwrap();
+        assert_eq!(restored.get(b"fresh-key").unwrap(), Some(b"fresh-value".to_vec()));
+        assert_eq!(restored.get(b"stale-key").unwrap(), None, "stale pre-restore state must not survive");
+    }
+
+    #[test]
+    fn snapshot_blob_captures_unflushed_memtable_data() {
+        // No explicit flush() here — this is exactly the gap live-testing
+        // caught: snapshot_blob() must not silently miss whatever is still
+        // sitting in the active memtable.
+        let src_dir = TempDir::new();
+        let blob = {
+            let db = open(&src_dir);
+            db.put(b"never-flushed", b"but-still-here").unwrap();
+            db.snapshot_blob().unwrap()
+        };
+
+        let dst_dir = TempDir::new();
+        let restored = Db::restore(&dst_dir.0, &blob).unwrap();
+        assert_eq!(restored.get(b"never-flushed").unwrap(), Some(b"but-still-here".to_vec()));
+    }
+
+    #[test]
+    fn restored_store_survives_its_own_further_reopen() {
+        let src_dir = TempDir::new();
+        let blob = {
+            let db = open(&src_dir);
+            db.put(b"a", b"1").unwrap();
+            db.flush().unwrap();
+            db.snapshot_blob().unwrap()
+        };
+
+        let dst_dir = TempDir::new();
+        Db::restore(&dst_dir.0, &blob).unwrap();
+        // A fresh Db::open over the restored directory — proving restore left
+        // behind a normal, durable store, not a one-shot in-memory view.
+        let reopened = open(&dst_dir);
+        assert_eq!(reopened.get(b"a").unwrap(), Some(b"1".to_vec()));
     }
 }

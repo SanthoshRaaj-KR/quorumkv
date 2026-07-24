@@ -16,9 +16,12 @@ import (
 // test SM; the LSM will hand back its SSTable set instead.
 type recorder struct{ applied [][]byte }
 
-func (r *recorder) Apply(cmd []byte) { r.applied = append(r.applied, append([]byte(nil), cmd...)) }
+func (r *recorder) Apply(cmd []byte) error {
+	r.applied = append(r.applied, append([]byte(nil), cmd...))
+	return nil
+}
 
-func (r *recorder) Snapshot() []byte {
+func (r *recorder) Snapshot() ([]byte, error) {
 	var buf []byte
 	for _, cmd := range r.applied {
 		var lenBuf [4]byte
@@ -26,10 +29,10 @@ func (r *recorder) Snapshot() []byte {
 		buf = append(buf, lenBuf[:]...)
 		buf = append(buf, cmd...)
 	}
-	return buf
+	return buf, nil
 }
 
-func (r *recorder) Restore(data []byte) {
+func (r *recorder) Restore(data []byte) error {
 	applied := make([][]byte, 0)
 	for len(data) >= 4 {
 		n := binary.LittleEndian.Uint32(data[:4])
@@ -41,6 +44,7 @@ func (r *recorder) Restore(data []byte) {
 		data = data[n:]
 	}
 	r.applied = applied
+	return nil
 }
 
 func (r *recorder) strings() []string {
