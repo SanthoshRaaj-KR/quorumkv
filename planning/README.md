@@ -31,10 +31,11 @@ Every phase file has the same shape:
 | 6 | [phase-06-raft-single.md](phase-06-raft-single.md) | Raft state machine, isolated | **built** ✅ |
 | 7 | [phase-07-election.md](phase-07-election.md) | Leader election over RPC | **built** ✅ (wire choice provisional — §2) |
 | 8 | [phase-08-replication.md](phase-08-replication.md) | Agree on one ordered log | **built** ✅ |
-| 9 | phase-09-snapshot.md | Stop the log growing forever | todo |
-| 10 | phase-10-apply-seam.md | Connect Raft `apply` → LSM | todo |
-| 11 | phase-11-client.md | Usable from outside | todo |
+| 9 | phase-09-snapshot.md | Stop the log growing forever | **built** ✅ |
+| 10 | [phase-10-apply-seam.md](phase-10-apply-seam.md) | Connect Raft `apply` → LSM | **built** ✅ |
+| 11 | [phase-11-client.md](phase-11-client.md) | Usable from outside | **planned** — decisions drafted, pending sign-off, not yet built |
 | 12 | phase-12-chaos.md | Prove it under failure | todo |
+| 13 | [phase-13-fault-injection.md](phase-13-fault-injection.md) | Deterministic storage-level fault injection | planned (drafted ahead of 11/12) |
 
 ## Decision log
 
@@ -84,5 +85,9 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Follower commit bound | 8 | `min(leaderCommit, last new entry)` — fixes Phase 7's `localLastIndex` | locked |
 | `Ready` contract | 8 | gains `TruncateFrom`; order becomes truncate → append → fsync → send → apply | locked |
 | Replication batching | 8 | 64 entries / 1 MiB per `AppendEntries`; send on `Propose`, heartbeats repair | locked |
-| Rust ↔ Go boundary | 10 | TBD | open |
-| Read consistency mode | 11 | Leader-only to start | tentative |
+| Rust ↔ Go boundary | 10 | local sidecar process per node, hand-rolled HTTP/1.1 subset (not FFI, not gRPC — both mechanically blocked, no `gcc`/`protoc` on this machine) | locked, built |
+| `StateMachine` interface | 10 | fallible: `Apply/Snapshot/Restore` all gain `error` | locked, built |
+| Command encoding | 10 | `op(1)｜keyLen(4)｜key｜valueLen(4)｜value`, same shape/op-bytes as WAL | locked, built |
+| Client wire protocol | 11 | hand-rolled HTTP/1.1 subset, JSON — same fork as phase 10's sidecar, applied one layer out | locked (pending sign-off) |
+| Write acknowledgment | 11 | new `Server.ProposeAndWait`, resolves on `LastApplied` reaching `(index,term)`; term mismatch → new `ErrProposalLost` | locked (pending sign-off) |
+| Read consistency mode | 11 | Leader-only, no confirmation | locked |
