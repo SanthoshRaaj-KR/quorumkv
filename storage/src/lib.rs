@@ -12,6 +12,7 @@
 pub mod bloom;
 pub mod compaction;
 pub mod db;
+pub mod faultsim;
 pub mod logger;
 pub mod manifest;
 pub mod memtable;

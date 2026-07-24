@@ -28,8 +28,10 @@
 //! concern for Track A).
 
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
+
+use crate::faultsim::FileSink;
 
 const OP_PUT: u8 = 0x01;
 const OP_DELETE: u8 = 0x02;
@@ -176,7 +178,7 @@ fn read_bytes<'a>(buf: &'a [u8], off: &mut usize, n: usize) -> Result<&'a [u8], 
 /// `append` returns `Ok` — never before. If `append` returns `Err`, the write
 /// was not durable and must not be treated as acknowledged (phase-01 §4).
 pub struct WalWriter {
-    file: File,
+    file: Box<dyn FileSink>,
     #[allow(dead_code)] // used by later phases (segment discard); kept for clarity now.
     path: PathBuf,
 }
@@ -188,6 +190,17 @@ impl WalWriter {
     /// *existence* is durable, not just its contents (phase-01 §2c). Reopening an
     /// existing WAL appends to it — it is never truncated.
     pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        Self::open_with_sink(path, |f| Box::new(f))
+    }
+
+    /// Same as [`open`](Self::open), but lets a test substitute the
+    /// underlying [`FileSink`] — a [`crate::faultsim::FaultyFile`] instead
+    /// of the real one (planning/phase-13-fault-injection.md §1a).
+    /// Production code always uses [`open`](Self::open).
+    pub fn open_with_sink(
+        path: impl AsRef<Path>,
+        make_sink: impl FnOnce(File) -> Box<dyn FileSink>,
+    ) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
         let existed = path.exists();
 
@@ -203,7 +216,7 @@ impl WalWriter {
         } else {
             log::debug!(target: "wal", "opened existing {}", path.display());
         }
-        Ok(Self { file, path })
+        Ok(Self { file: make_sink(file), path })
     }
 
     /// Encode `rec`, append it, and make it durable before returning.

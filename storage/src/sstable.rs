@@ -48,11 +48,12 @@
 
 use std::cmp::Ordering;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{self, AtomicU64};
 
 use crate::bloom::{BloomFilter, DEFAULT_BITS_PER_KEY};
+use crate::faultsim::FileSink;
 use crate::memtable::Value;
 use crate::wal::{fsync_dir, parent_dir};
 
@@ -312,7 +313,7 @@ pub fn remove_orphan_tmp(dir: &Path) -> io::Result<()> {
 /// while the backing WAL segment still holds the data — never a half-visible
 /// SSTable.
 pub struct SstWriter {
-    file: File,
+    file: Box<dyn FileSink>,
     tmp_path: PathBuf,
     final_path: PathBuf,
     /// Running write offset into the file (bytes written so far).
@@ -336,11 +337,26 @@ impl SstWriter {
     /// `num_keys` sizes the Bloom filter (use the memtable's entry count);
     /// `bits_per_key` is the false-positive/RAM knob.
     pub fn create(dir: &Path, file_number: u64, num_keys: usize, bits_per_key: u32) -> io::Result<Self> {
+        Self::create_with_sink(dir, file_number, num_keys, bits_per_key, |f| Box::new(f))
+    }
+
+    /// Same as [`create`](Self::create), but lets a test substitute the
+    /// underlying [`FileSink`] — a [`crate::faultsim::FaultyFile`] instead
+    /// of the real one (planning/phase-13-fault-injection.md §1a, and the
+    /// seam Phase 12's own disk-full-mid-compaction test reuses).
+    /// Production code always uses [`create`](Self::create).
+    pub fn create_with_sink(
+        dir: &Path,
+        file_number: u64,
+        num_keys: usize,
+        bits_per_key: u32,
+        make_sink: impl FnOnce(File) -> Box<dyn FileSink>,
+    ) -> io::Result<Self> {
         let final_path = dir.join(sst_filename(file_number));
         let tmp_path = dir.join(format!("{}.tmp", sst_filename(file_number)));
         let file = OpenOptions::new().create(true).write(true).truncate(true).open(&tmp_path)?;
         Ok(SstWriter {
-            file,
+            file: make_sink(file),
             tmp_path,
             final_path,
             offset: 0,
@@ -469,12 +485,32 @@ pub fn write_sstable<I>(
 where
     I: IntoIterator<Item = (Vec<u8>, Value)>,
 {
+    write_sstable_with_sink(dir, file_number, entries, num_keys, bits_per_key, |f| Box::new(f))
+}
+
+/// Same as [`write_sstable`], but lets a test substitute the underlying
+/// [`FileSink`] for the one file this call writes — used by both flush and
+/// compaction (`run_compaction` funnels its merged output through here too,
+/// planning/phase-05-compaction.md §4a), so faulting it here covers both of
+/// phase-13's SSTable-write scenarios. Production code always uses
+/// [`write_sstable`].
+pub fn write_sstable_with_sink<I>(
+    dir: &Path,
+    file_number: u64,
+    entries: I,
+    num_keys: usize,
+    bits_per_key: u32,
+    make_sink: impl FnOnce(File) -> Box<dyn FileSink>,
+) -> io::Result<Option<PathBuf>>
+where
+    I: IntoIterator<Item = (Vec<u8>, Value)>,
+{
     let mut it = entries.into_iter().peekable();
     if it.peek().is_none() {
         log::debug!(target: "sstable", "skipping flush: no entries");
         return Ok(None);
     }
-    let mut w = SstWriter::create(dir, file_number, num_keys, bits_per_key)?;
+    let mut w = SstWriter::create_with_sink(dir, file_number, num_keys, bits_per_key, make_sink)?;
     for (key, value) in it {
         w.add(&key, &value)?;
     }

@@ -16,12 +16,18 @@
 //! the inputs intact; a crash after leaves unreferenced inputs (also swept). The
 //! MANIFEST always names a consistent set.
 
-use std::fs;
+use std::fs::{self, File};
 use std::path::Path;
 
+use crate::faultsim::FileSink;
 use crate::manifest::{FileMeta, VersionEdit, VersionSet};
 use crate::merge::{Merge, Source};
-use crate::sstable::{sst_filename, write_sstable, SstReader};
+use crate::sstable::{sst_filename, write_sstable_with_sink, SstReader};
+
+// `write_sstable_with_sink(..., |f| Box::new(f))` is `write_sstable`'s own
+// definition (sstable.rs) — reused directly here rather than re-importing
+// the plain name, so `run_compaction`'s only difference from
+// `run_compaction_with_sink` is which closure it passes.
 
 /// A chosen unit of compaction work: which files to merge, where the output goes,
 /// and whether tombstones may be dropped (true only when the bottom-most data is
@@ -80,6 +86,20 @@ pub fn run_compaction(
     compaction: &Compaction,
     bits_per_key: u32,
 ) -> std::io::Result<()> {
+    run_compaction_with_sink(dir, versions, compaction, bits_per_key, |f| Box::new(f))
+}
+
+/// Same as [`run_compaction`], but lets a test substitute the [`FileSink`]
+/// behind the merged output's write — a [`crate::faultsim::FaultyFile`]
+/// instead of the real one, for phase-13-fault-injection.md's "crash
+/// mid-compaction" scenario. Production code always uses [`run_compaction`].
+pub fn run_compaction_with_sink(
+    dir: &Path,
+    versions: &VersionSet,
+    compaction: &Compaction,
+    bits_per_key: u32,
+    make_sink: impl FnOnce(File) -> Box<dyn FileSink>,
+) -> std::io::Result<()> {
     log::info!(
         target: "compaction",
         "compacting {} file(s) -> level {} (drop_tombstones={})",
@@ -101,7 +121,7 @@ pub fn run_compaction(
 
     // Write the output (skipped entirely if the merge produced nothing).
     let out_number = versions.next_file_number();
-    let output = write_sstable(dir, out_number, merged, survivor_count, bits_per_key)?;
+    let output = write_sstable_with_sink(dir, out_number, merged, survivor_count, bits_per_key, make_sink)?;
 
     // One atomic edit: remove inputs, add the output (if any).
     let mut edit = VersionEdit { added: Vec::new(), deleted: compaction.inputs.clone() };
