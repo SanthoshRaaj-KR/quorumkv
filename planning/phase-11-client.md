@@ -138,9 +138,7 @@ uses (nothing internal currently needs to block on commit) — this is an
 
 This is the one change to a Phase 6/7 contract this phase makes, and — same
 as phase-10 §2 — it's additive and low-risk (new method, new field, zero
-change to `Propose`'s existing behavior or tests), but flagging it the same
-way: **pending your sign-off**, since `ErrProposalLost` is a new error
-callers now need to know how to handle.
+change to `Propose`'s existing behavior or tests). **Signed off.**
 
 ---
 
@@ -309,8 +307,8 @@ here.
 
 | Decision | Choice |
 |---|---|
-| Client wire protocol | hand-rolled HTTP/1.1 subset, JSON bodies — same fork phase-10 already resolved for the sidecar, applied one layer out |
-| Write acknowledgment | new `Server.ProposeAndWait(cmd, timeout) (index, err)`, additive to `Propose`; resolves on `LastApplied` reaching the proposed `(index, term)`; a term mismatch (leadership lost before commit) surfaces as new `ErrProposalLost` — **pending sign-off** |
+| Client wire protocol | hand-rolled HTTP/1.1 subset, JSON bodies — same fork phase-10 already resolved for the sidecar, applied one layer out — **signed off** |
+| Write acknowledgment | new `Server.ProposeAndWait(cmd, timeout) (index, err)`, additive to `Propose`; resolves on `LastApplied` reaching the proposed `(index, term)`; a term mismatch (leadership lost before commit) surfaces as new `ErrProposalLost` — **signed off** |
 | Read consistency mode | leader-only, no confirmation (locks README's prior "tentative" entry) — `Get` routed through the same leader-discovery path as writes |
 | Leader discovery / retry | client holds a static `id -> address` map (no discovery, standing project rule); on `not leader` hop straight to the hinted id; on unreachable/unknown-leader hop to the next id after a short backoff; capped attempts |
 | New process | `cmd/quorumkv-node` — the standalone one-node-per-process binary phase-10 §7 deferred to this phase |

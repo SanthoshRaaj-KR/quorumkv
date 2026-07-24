@@ -88,6 +88,6 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Rust ↔ Go boundary | 10 | local sidecar process per node, hand-rolled HTTP/1.1 subset (not FFI, not gRPC — both mechanically blocked, no `gcc`/`protoc` on this machine) | locked, built |
 | `StateMachine` interface | 10 | fallible: `Apply/Snapshot/Restore` all gain `error` | locked, built |
 | Command encoding | 10 | `op(1)｜keyLen(4)｜key｜valueLen(4)｜value`, same shape/op-bytes as WAL | locked, built |
-| Client wire protocol | 11 | hand-rolled HTTP/1.1 subset, JSON — same fork as phase 10's sidecar, applied one layer out | locked (pending sign-off) |
-| Write acknowledgment | 11 | new `Server.ProposeAndWait`, resolves on `LastApplied` reaching `(index,term)`; term mismatch → new `ErrProposalLost` | locked (pending sign-off) |
+| Client wire protocol | 11 | hand-rolled HTTP/1.1 subset, JSON — same fork as phase 10's sidecar, applied one layer out | locked, signed off |
+| Write acknowledgment | 11 | new `Server.ProposeAndWait`, resolves on `LastApplied` reaching `(index,term)`; term mismatch → new `ErrProposalLost` | locked, signed off |
 | Read consistency mode | 11 | Leader-only, no confirmation | locked |
