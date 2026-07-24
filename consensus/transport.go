@@ -176,6 +176,12 @@ type Bus struct {
 	// Reorder, when set, is applied to each destination's queue on Take —
 	// a hook for deliberately delivering out of order.
 	Reorder func([]Message) []Message
+	// OnMessage, when set, is called for every message actually queued for
+	// delivery (i.e. not dropped because the sender or recipient is
+	// isolated) — an observation hook for tooling like the dashboard's live
+	// message trace. Called with the bus's internal lock held, so it must
+	// not call back into the Bus.
+	OnMessage func(Message)
 }
 
 func NewBus() *Bus {
@@ -248,5 +254,8 @@ func (l *loopback) Send(msgs []Message) {
 			continue
 		}
 		l.bus.queues[m.To] = append(l.bus.queues[m.To], m)
+		if l.bus.OnMessage != nil {
+			l.bus.OnMessage(m)
+		}
 	}
 }

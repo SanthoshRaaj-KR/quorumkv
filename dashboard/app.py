@@ -17,14 +17,17 @@ then open http://127.0.0.1:5055/
 
 from __future__ import annotations
 
+import atexit
 import json
 import re
 import subprocess
 import time
+import urllib.error
+import urllib.request
 from itertools import groupby
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 STORAGE_DIR = BASE_DIR / "storage"
@@ -314,6 +317,67 @@ def run_suite(suite: dict) -> dict:
     return result
 
 
+# ─── live sandbox backend (Go) ────────────────────────────────────────────────
+#
+# The "run tests" side above works by shelling out per request. The live
+# sandbox is different: it's a real, *stateful* Raft cluster you poke at
+# incrementally (propose, tick, crash a node, ...), which needs a long-lived
+# process holding that state between requests. That's `consensus.Sandbox`,
+# wrapped by a tiny Go HTTP server (consensus/cmd/dashboard-backend) — Flask
+# just spawns it once and proxies to it, so the whole dashboard is still one
+# command to run.
+
+SANDBOX_BACKEND = "http://127.0.0.1:5056"
+_sandbox_proc: subprocess.Popen | None = None
+
+
+def start_sandbox_backend() -> None:
+    global _sandbox_proc
+    if _sandbox_proc is not None:
+        return
+    _sandbox_proc = subprocess.Popen(
+        ["go", "run", "./cmd/dashboard-backend"], cwd=str(CONSENSUS_DIR)
+    )
+    atexit.register(_stop_sandbox_backend)
+
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        try:
+            urllib.request.urlopen(SANDBOX_BACKEND + "/state", timeout=1).close()
+            print("[dashboard] sandbox backend is up on", SANDBOX_BACKEND)
+            return
+        except Exception:
+            time.sleep(0.3)
+    print("[dashboard] WARNING: sandbox backend did not respond within 20s — "
+          "check the console for `go run` errors")
+
+
+def _stop_sandbox_backend() -> None:
+    if _sandbox_proc is not None and _sandbox_proc.poll() is None:
+        _sandbox_proc.terminate()
+
+
+def _sandbox_request(path: str, payload=None):
+    """Proxy one call to the Go sandbox backend. Returns (json_body, http_status)."""
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        SANDBOX_BACKEND + path,
+        data=data,
+        method="POST" if data is not None else "GET",
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8")), resp.status
+    except urllib.error.HTTPError as e:
+        try:
+            return json.loads(e.read().decode("utf-8")), e.code
+        except json.JSONDecodeError:
+            return {"error": f"sandbox backend returned {e.code}"}, e.code
+    except urllib.error.URLError as e:
+        return {"error": f"sandbox backend unreachable: {e.reason} — is `go run ./cmd/dashboard-backend` still starting?"}, 503
+
+
 # ─── Flask app ────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -326,6 +390,38 @@ def index():
         rust_phases=group_by_phase(RUST_SUITES),
         go_phases=group_by_phase(GO_SUITES),
     )
+
+
+@app.route("/sandbox")
+def sandbox_page():
+    return render_template("sandbox.html")
+
+
+@app.route("/api/sandbox/state")
+def sandbox_state():
+    data, status = _sandbox_request("/state")
+    return jsonify(data), status
+
+
+@app.route("/api/sandbox/reset", methods=["POST"])
+def sandbox_reset():
+    data, status = _sandbox_request("/reset", request.get_json(silent=True) or {})
+    return jsonify(data), status
+
+
+@app.route("/api/sandbox/tick", methods=["POST"])
+def sandbox_tick():
+    n = request.args.get("n", "1")
+    data, status = _sandbox_request(f"/tick?n={n}")
+    return jsonify(data), status
+
+
+@app.route("/api/sandbox/<action>", methods=["POST"])
+def sandbox_action(action: str):
+    if action not in {"propose", "crash", "restart", "isolate", "heal"}:
+        return jsonify({"error": f"unknown sandbox action {action!r}"}), 404
+    data, status = _sandbox_request(f"/{action}", request.get_json(silent=True) or {})
+    return jsonify(data), status
 
 
 @app.route("/api/run/<path:suite_id>", methods=["POST"])
@@ -345,6 +441,7 @@ def api_run_all(engine: str):
 
 
 if __name__ == "__main__":
+    start_sandbox_backend()
     # use_reloader=False: the watchdog reloader has been seen false-triggering
     # on unrelated stdlib file "changes" in this environment. Not needed for a
     # local dev tool anyway — just restart it after editing.

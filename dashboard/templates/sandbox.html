@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>quorumkv live sandbox</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='sandbox.css') }}">
+</head>
+<body>
+  <header>
+    <h1>quorumkv live cluster sandbox</h1>
+    <p class="sub">
+      <a href="/">← back to test dashboard</a> — a real Raft cluster (the Go <code>consensus</code>
+      package, unmodified) you drive by hand: propose commands, tick the clock, crash / restart /
+      partition nodes, and watch roles, logs, commit index and the message trace change live.
+    </p>
+  </header>
+
+  <div class="sandbox-controls">
+    <label>nodes <input type="number" id="cfg-nodes" value="3" min="1" max="7"></label>
+    <label>snapshot threshold
+      <input type="number" id="cfg-threshold" value="0" min="0"
+             title="0 = default (10000). Set small, e.g. 5, to reach InstallSnapshot quickly.">
+    </label>
+    <button onclick="doReset()">Reset cluster</button>
+    <span class="spacer"></span>
+    <button onclick="doTick(1)">Tick ×1</button>
+    <button onclick="doTick(5)">Tick ×5</button>
+    <button onclick="doTick(20)">Tick ×20</button>
+  </div>
+
+  <main>
+    <div id="nodes" class="node-grid"></div>
+    <div class="trace-panel">
+      <h3>Message trace <span class="hint">(most recent first — what actually crossed the wire)</span></h3>
+      <div id="trace" class="trace-list"></div>
+    </div>
+  </main>
+
+  <script src="{{ url_for('static', filename='sandbox.js') }}"></script>
+</body>
+</html>
