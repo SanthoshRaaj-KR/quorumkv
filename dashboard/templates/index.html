@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>quorumkv test dashboard</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <header>
+    <h1>quorumkv test dashboard</h1>
+    <p class="sub">Runs the real suites — <code>cargo test</code> for the LSM storage engine, <code>go test</code> for the Raft consensus layer — grouped by phase. Nothing here is mocked.</p>
+  </header>
+
+  <main class="columns">
+    <section class="engine" data-engine-section="rust">
+      <div class="engine-head">
+        <h2>Rust storage engine <span class="track">Track A · phases 1–5</span></h2>
+        <button class="run-all" onclick="runAll('rust', this)">Run all</button>
+      </div>
+      <div class="engine-summary" id="summary-rust"></div>
+
+      {% for phase, title, suites in rust_phases %}
+      <div class="phase-block">
+        <h3>{{ title }}</h3>
+        {% for s in suites %}
+          {% include "_card.html" %}
+        {% endfor %}
+      </div>
+      {% endfor %}
+    </section>
+
+    <section class="engine" data-engine-section="go">
+      <div class="engine-head">
+        <h2>Go consensus layer <span class="track">Track B · phases 6–9</span></h2>
+        <button class="run-all" onclick="runAll('go', this)">Run all</button>
+      </div>
+      <div class="engine-summary" id="summary-go"></div>
+
+      {% for phase, title, suites in go_phases %}
+      <div class="phase-block">
+        <h3>{{ title }}</h3>
+        {% for s in suites %}
+          {% include "_card.html" %}
+        {% endfor %}
+      </div>
+      {% endfor %}
+    </section>
+  </main>
+
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

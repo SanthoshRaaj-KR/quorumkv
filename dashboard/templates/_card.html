@@ -1,0 +1,13 @@
+<div class="card" id="card-{{ s.id }}" data-engine="{{ s.engine }}" data-suite-id="{{ s.id }}">
+  <div class="card-head">
+    <div>
+      <span class="file">{{ s.file }}</span>
+      <span class="label">{{ s.label }}</span>
+    </div>
+    <div class="card-actions">
+      <span class="count">{{ s.test_names|length }} test{{ 's' if s.test_names|length != 1 else '' }}</span>
+      <button class="run-one" onclick="runSuite('{{ s.id }}', this)">Run</button>
+    </div>
+  </div>
+  <div class="results" id="results-{{ s.id }}"></div>
+</div>
