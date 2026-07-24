@@ -78,6 +78,11 @@ type FileStorage struct {
 	// small slice).
 	hasSnapshot bool
 	snapshot    Snapshot
+
+	// appendFault, when set by a test (faultsim.go, planning/phase-13 §2's
+	// Go-side mirror), overrides one future AppendEntries call. Always nil
+	// in production — OpenFileStorage never sets it.
+	appendFault *appendFault
 }
 
 var _ Storage = (*FileStorage)(nil)
@@ -211,6 +216,27 @@ func (s *FileStorage) AppendEntries(entries []Entry) error {
 		buf = append(buf, enc...)
 		at += int64(len(enc))
 	}
+	if s.appendFault != nil {
+		tornLen, fire, skip := s.appendFault.poll(len(buf))
+		switch {
+		case skip:
+			// The process "already crashed": nothing more reaches disk,
+			// even though this call looks completely normal to its caller.
+			return nil
+		case fire:
+			// A torn write the caller doesn't even notice, matching what a
+			// real crash leaves behind. Deliberately no Sync and no
+			// offsets/size update — this batch never became durable, and a
+			// fresh reopen's replay is what decides what survived, from the
+			// CRC alone (the same self-certifying recovery model as the
+			// WAL, mirrors storage/src/faultsim.rs §1b).
+			if _, err := s.logFile.Write(buf[:tornLen]); err != nil {
+				return fmt.Errorf("consensus: append to %s: %w", LogName, err)
+			}
+			return nil
+		}
+	}
+
 	if _, err := s.logFile.Write(buf); err != nil {
 		return fmt.Errorf("consensus: append to %s: %w", LogName, err)
 	}
