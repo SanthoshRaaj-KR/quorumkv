@@ -2,6 +2,7 @@ package consensus
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -10,10 +11,37 @@ import (
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
 // recorder is the Phase 6 state machine: it just remembers what it was told.
-// Phase 10 replaces it with the Rust LSM engine.
+// Phase 10 replaces it with the Rust LSM engine. Snapshot/Restore (Phase 9)
+// serialize the applied slice as length-prefixed commands — good enough for a
+// test SM; the LSM will hand back its SSTable set instead.
 type recorder struct{ applied [][]byte }
 
 func (r *recorder) Apply(cmd []byte) { r.applied = append(r.applied, append([]byte(nil), cmd...)) }
+
+func (r *recorder) Snapshot() []byte {
+	var buf []byte
+	for _, cmd := range r.applied {
+		var lenBuf [4]byte
+		binary.LittleEndian.PutUint32(lenBuf[:], uint32(len(cmd)))
+		buf = append(buf, lenBuf[:]...)
+		buf = append(buf, cmd...)
+	}
+	return buf
+}
+
+func (r *recorder) Restore(data []byte) {
+	applied := make([][]byte, 0)
+	for len(data) >= 4 {
+		n := binary.LittleEndian.Uint32(data[:4])
+		data = data[4:]
+		if uint64(len(data)) < uint64(n) {
+			break
+		}
+		applied = append(applied, append([]byte(nil), data[:n]...))
+		data = data[n:]
+	}
+	r.applied = applied
+}
 
 func (r *recorder) strings() []string {
 	out := make([]string, len(r.applied))

@@ -24,6 +24,15 @@ func (p *printer) Apply(cmd []byte) {
 	fmt.Printf("  [session %d] apply: %s\n", p.session, cmd)
 }
 
+// Snapshot/Restore (Phase 9): the demo never accumulates enough entries to
+// trigger one, but the interface still has to be satisfied. Phase 10 replaces
+// this whole type with the Rust LSM engine, which hands back its SSTable set.
+func (p *printer) Snapshot() []byte { return []byte(fmt.Sprintf("session-%d", p.session)) }
+
+func (p *printer) Restore(data []byte) {
+	fmt.Printf("  [session %d] restore: %s\n", p.session, data)
+}
+
 func main() {
 	dir := filepath.Join(os.TempDir(), "quorumkv-raft-demo")
 	_ = os.RemoveAll(dir) // start clean each run

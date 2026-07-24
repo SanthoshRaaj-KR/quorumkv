@@ -1,9 +1,14 @@
 package consensus
 
 // Driver owns the one thing [Node] deliberately does not: I/O, in the one order
-// that keeps Raft safe (§2).
+// that keeps Raft safe (§2, extended by Phase 8 §3 and Phase 9 §4):
 //
-//	persist HardState + entries  →  fsync  →  send  →  apply  →  Advance
+//	persist Snapshot → fsync → compact log file → (restore SM)
+//	                                             → truncate
+//	                                             → persist HardState + entries → fsync
+//	                                             → send
+//	                                             → apply
+//	                                             → Advance()
 //
 // Keeping that sequence in exactly one place is the point of the driven-core
 // design — there is a single function to audit, and Phase 7 changes it only by
@@ -15,6 +20,12 @@ type Driver struct {
 	storage Storage
 	sm      StateMachine
 	tr      Transport
+
+	// Local snapshot policy (Phase 9 §3). Every node snapshots independently
+	// on its own applied state — this is driver housekeeping, never part of
+	// Ready.
+	snapshotThreshold int
+	lastSnapshotIndex uint64
 }
 
 // NewDriver builds a node from cfg and wires it to a state machine and an
@@ -25,7 +36,24 @@ func NewDriver(cfg Config, sm StateMachine, tr Transport) (*Driver, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &Driver{node: n, storage: cfg.Storage, sm: sm, tr: tr}
+
+	threshold := cfg.SnapshotThreshold
+	if threshold <= 0 {
+		threshold = DefaultSnapshotThreshold
+	}
+	d := &Driver{node: n, storage: cfg.Storage, sm: sm, tr: tr, snapshotThreshold: threshold}
+
+	// If a snapshot already exists, the state machine must start from it
+	// before anything else replays on top (Phase 9 §5) — including the very
+	// first d.run() below, which re-applies whatever committed entries
+	// survived above the boundary.
+	if snap, ok, err := cfg.Storage.LoadSnapshot(); err != nil {
+		return nil, err
+	} else if ok {
+		d.lastSnapshotIndex = snap.Index
+		sm.Restore(snap.Data)
+	}
+
 	// A freshly restored node may already owe work (a reloaded HardState is not
 	// dirty, but committed entries from a previous life are re-applied).
 	if err := d.run(); err != nil {
@@ -72,6 +100,30 @@ func (d *Driver) run() error {
 		return nil
 	}
 
+	// 0. A received snapshot supersedes everything older — persist it and
+	//    compact the log file to match before any other durable operation
+	//    (Phase 9 §4). RestoreFromSnapshot additionally wipes any on-disk tail
+	//    above the boundary: RestoreToSnapshot already discarded it from the
+	//    in-memory log (an installed snapshot is always authoritative, §7), so
+	//    nothing above the boundary may survive on disk either.
+	if rd.Snapshot != nil {
+		if err := d.storage.SaveSnapshot(*rd.Snapshot); err != nil {
+			return err
+		}
+		if rd.RestoreFromSnapshot {
+			if err := d.storage.TruncateFrom(rd.Snapshot.Index + 1); err != nil {
+				return err
+			}
+		}
+		if err := d.storage.CompactLog(rd.Snapshot.Index); err != nil {
+			return err
+		}
+		if rd.RestoreFromSnapshot {
+			d.sm.Restore(rd.Snapshot.Data)
+		}
+		d.lastSnapshotIndex = rd.Snapshot.Index
+	}
+
 	// 1. Durable first — always, before anything observable leaves this node.
 	//
 	//    Truncation precedes the append and is not merely stylistic: appending
@@ -108,5 +160,39 @@ func (d *Driver) run() error {
 	}
 
 	d.node.Advance()
+
+	// 4. Local snapshot housekeeping — driver-side, never through Ready
+	//    (Phase 9 §3): decided here, after apply, on this node's own applied
+	//    state.
+	return d.maybeSnapshot()
+}
+
+// maybeSnapshot takes a new local snapshot once enough entries have been
+// applied beyond the last one (Config.SnapshotThreshold). It persists the
+// snapshot, compacts the log file, and only then tells the node to compact its
+// in-memory log to match — SaveSnapshot before CompactLog is the same
+// durable-before-destructive rule as everywhere else in this package.
+func (d *Driver) maybeSnapshot() error {
+	applied := d.node.LastApplied()
+	if applied == 0 || applied <= d.lastSnapshotIndex {
+		return nil
+	}
+	if applied-d.lastSnapshotIndex < uint64(d.snapshotThreshold) {
+		return nil
+	}
+
+	snap := Snapshot{
+		Index: applied,
+		Term:  d.node.Log().Term(applied),
+		Data:  d.sm.Snapshot(),
+	}
+	if err := d.storage.SaveSnapshot(snap); err != nil {
+		return err
+	}
+	if err := d.storage.CompactLog(snap.Index); err != nil {
+		return err
+	}
+	d.node.SnapshotTaken(snap)
+	d.lastSnapshotIndex = snap.Index
 	return nil
 }

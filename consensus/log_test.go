@@ -7,11 +7,11 @@ func buildLog(terms ...uint64) *Log {
 	for i, term := range terms {
 		entries = append(entries, Entry{Term: term, Index: uint64(i + 1)})
 	}
-	return NewLog(entries)
+	return NewLog(Entry{}, entries)
 }
 
 func TestEmptyLogFallsOutOfTheSentinel(t *testing.T) {
-	l := NewLog(nil)
+	l := NewLog(Entry{}, nil)
 	if l.LastIndex() != 0 {
 		t.Errorf("LastIndex = %d, want 0", l.LastIndex())
 	}
@@ -140,7 +140,7 @@ func TestIsUpToDate(t *testing.T) {
 	}
 
 	// An empty local log is never more up-to-date than anyone.
-	empty := NewLog(nil)
+	empty := NewLog(Entry{}, nil)
 	if !empty.IsUpToDate(0, 0) {
 		t.Error("an empty candidate ties an empty local log")
 	}
