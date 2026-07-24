@@ -29,6 +29,37 @@ sequence. Results show per-test pass/fail, timing where available, and the
 captured failure output for anything that fails. A suite whose build itself
 fails (compile error) shows that instead of a test list.
 
+## Live cluster sandbox
+
+<http://127.0.0.1:5055/sandbox> — a second page for actually *driving* a real
+Raft cluster instead of just running its tests. This isn't a simulation: it's
+the unmodified `consensus.Node`/`Driver`/`Bus` code from the library itself,
+wrapped by `consensus.Sandbox` (`consensus/sandbox.go`) and exposed over HTTP
+by a tiny Go server (`consensus/cmd/dashboard-backend`) that Flask launches
+automatically and proxies to at `/api/sandbox/*`.
+
+From the page you can, per node:
+
+- **Propose** a command on whichever node is currently leader — watch the
+  resulting `AppendEntries` traffic, commit index, and applied state show up
+  live in the node cards and the message trace below them.
+- **Crash** (kill -9: stops ticking, drops in-flight messages) and
+  **Restart** (reloads from that node's own in-memory storage, exactly like
+  a real process restart) — the classic "fall behind, catch up" path. Set a
+  small **snapshot threshold** at reset time and this same crash/restart
+  cycle demonstrates `InstallSnapshot` instead of entry-by-entry replay —
+  watch for a `snap` row in the trace.
+- **Partition** (isolate: keeps ticking, but no message crosses either way)
+  and **Heal** — watch an isolated node campaign on its own, and watch the
+  term-jump when it reconnects and the cluster reconverges on one leader.
+
+Every node card shows role, term, leader, commit/applied/last index, the
+snapshot boundary (`offset` — entries at or below it are grayed out as
+"compacted"), its log entries, and what its state machine has applied. The
+message trace is exactly what crossed the bus, in order, with a one-line
+summary per message (e.g. `AppendEntries prevLogIndex=4 prevLogTerm=2
+entries=2 leaderCommit=4` or `InstallSnapshot snapshotIndex=9 ...`).
+
 ## Notes
 
 - Every run is a real subprocess call — a Go suite takes ~2s (mostly Go's own
@@ -41,3 +72,7 @@ fails (compile error) shows that instead of a test list.
 - The dev server's reloader is disabled (`use_reloader=False`) — it was
   false-triggering restarts on unrelated stdlib file "changes" in this
   environment. Restart the process manually after editing `app.py`.
+- The sandbox backend is spawned via `go run ./cmd/dashboard-backend` when
+  Flask starts (first launch pays Go's compile cost, ~1-2s) and killed via
+  `atexit` when Flask exits. If port 5056 is already in use, kill whatever's
+  on it — the dashboard doesn't try to reuse an existing instance.
