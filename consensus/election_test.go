@@ -1,6 +1,7 @@
 package consensus
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 )
@@ -138,6 +139,10 @@ func (c *cluster) checkInvariant() {
 // checkCommittedNeverLost is the third done-when of Phase 8, as an invariant:
 // once an index is committed anywhere, no node may ever hold a different entry
 // at that index, and no node that had it may lose it.
+//
+// A node may have compacted its log past some of these indices (Phase 9):
+// that is not loss, since the snapshot itself is the durable record of them,
+// so the scan starts above whatever boundary this node currently holds.
 func (c *cluster) checkCommittedNeverLost() {
 	c.t.Helper()
 	// Record everything newly committed.
@@ -146,7 +151,7 @@ func (c *cluster) checkCommittedNeverLost() {
 			continue
 		}
 		n := c.node(id)
-		for i := uint64(1); i <= n.CommitIndex(); i++ {
+		for i := n.Log().Offset() + 1; i <= n.CommitIndex(); i++ {
 			term := n.Log().Term(i)
 			if prev, ok := c.committed[i]; ok && prev != term {
 				c.t.Fatalf("committed entry %d changed term %d → %d on node %d", i, prev, term, id)
@@ -175,6 +180,10 @@ func (c *cluster) checkCommittedNeverLost() {
 // entry with the same index and term, the logs are identical in every preceding
 // entry. Equivalently — once two logs diverge at some index, they may never
 // agree again above it.
+//
+// The comparison only covers indices both logs still hold (Phase 9): a node
+// that has compacted past some of these has traded that range for a snapshot,
+// which is a separate guarantee, not a Log Matching violation.
 func (c *cluster) checkLogMatching() {
 	c.t.Helper()
 	for ai := 0; ai < len(c.ids); ai++ {
@@ -184,9 +193,13 @@ func (c *cluster) checkLogMatching() {
 				continue
 			}
 			la, lb := c.node(a).Log(), c.node(b).Log()
+			start := la.Offset()
+			if lb.Offset() > start {
+				start = lb.Offset()
+			}
 			limit := min(la.LastIndex(), lb.LastIndex())
 			diverged := uint64(0)
-			for i := uint64(1); i <= limit; i++ {
+			for i := start + 1; i <= limit; i++ {
 				if la.Term(i) != lb.Term(i) {
 					if diverged == 0 {
 						diverged = i
@@ -203,27 +216,43 @@ func (c *cluster) checkLogMatching() {
 	}
 }
 
-// logsIdentical reports whether every live node holds exactly the same entries.
+// logsIdentical reports whether every live node's log agrees — same end point,
+// same content everywhere both still hold it. Raw entries-list equality
+// (Entries()) stopped being meaningful once nodes may sit at different
+// snapshot boundaries (Phase 9): two logs can be the same replicated history
+// while one holds more of its prefix than the other.
 func (c *cluster) logsIdentical() bool {
-	var ref []Entry
-	first := true
+	var ref *Log
 	for _, id := range c.ids {
 		if c.down[id] {
 			continue
 		}
-		got := c.node(id).Log().Entries()
-		if first {
-			ref, first = got, false
+		got := c.node(id).Log()
+		if ref == nil {
+			ref = got
 			continue
 		}
-		if len(got) != len(ref) {
+		if !logsMatch(ref, got) {
 			return false
 		}
-		for i := range got {
-			if got[i].Term != ref[i].Term || got[i].Index != ref[i].Index ||
-				string(got[i].Cmd) != string(ref[i].Cmd) {
-				return false
-			}
+	}
+	return true
+}
+
+// logsMatch reports whether a and b end at the same (index, term) and agree
+// on every entry in their overlapping range.
+func logsMatch(a, b *Log) bool {
+	if a.LastIndex() != b.LastIndex() || a.LastTerm() != b.LastTerm() {
+		return false
+	}
+	start := a.Offset()
+	if b.Offset() > start {
+		start = b.Offset()
+	}
+	for i := start + 1; i <= a.LastIndex(); i++ {
+		ea, eb := a.At(i), b.At(i)
+		if ea.Term != eb.Term || !bytes.Equal(ea.Cmd, eb.Cmd) {
+			return false
 		}
 	}
 	return true
