@@ -260,7 +260,7 @@ func TestUnknownWriteStillCatchesAGenuineViolation(t *testing.T) {
 func TestUnknownGetIsIgnored(t *testing.T) {
 	h := historyOf(
 		put("k", "v1", 0, 10),
-		{Key: "k", Kind: OpGet, Ok: false, Start: at(15), End: at(18)}, // no data
+		Op{Key: "k", Kind: OpGet, Ok: false, Start: at(15), End: at(18)}, // no data
 		get("k", found("v1"), 20, 30),
 	)
 	ok, v := Check(h)
