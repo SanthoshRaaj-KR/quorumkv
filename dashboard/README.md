@@ -21,6 +21,28 @@ pip install -r requirements.txt
 python app.py
 ```
 
+### Pre-warm (recommended — avoids first-click lag)
+
+The first time you hit **Reset cluster** (or start the dashboard) in a session,
+each node's Rust sidecar is launched via `cargo run --bin sidecar`, and the
+sandbox backend itself is launched via `go run ./cmd/dashboard-backend` — if
+either binary isn't already built, that click pays the full compile cost, and
+`reset()` spawns nodes **serially**, so a 3-node cluster pays it up to three
+times in a row before the page responds. Once both binaries are built (and
+the OS has paged them into its file cache from that first run), everything
+after is near-instant — which is why the lag only shows up once per session.
+
+Build both ahead of time so the first click is already fast:
+
+```
+cd storage && cargo build --bin sidecar
+cd ../consensus && go build ./cmd/dashboard-backend
+```
+
+Re-run these after pulling changes that touch `storage/` or
+`consensus/cmd/dashboard-backend` / `consensus/engine`, since those
+invalidate the cached build.
+
 Then open <http://127.0.0.1:5055/>. Requires `go` and `cargo` on `PATH`.
 
 Each card shows a suite (source file) with a **Run** button; each engine
