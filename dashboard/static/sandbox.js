@@ -150,6 +150,13 @@ async function doTick(n) {
   refresh();
 }
 
+async function doTickRandom() {
+  const n = 5 + Math.floor(Math.random() * 196); // random in [5, 200]
+  const info = document.getElementById("tick-random-info");
+  if (info) info.textContent = `→ ticked ×${n}`;
+  await doTick(n);
+}
+
 async function doReset() {
   const nodes = parseInt(document.getElementById("cfg-nodes").value, 10) || 3;
   const threshold = parseInt(document.getElementById("cfg-threshold").value, 10) || 0;
