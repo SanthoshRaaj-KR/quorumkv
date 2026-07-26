@@ -104,6 +104,17 @@ Phase 13 inherits this file and extends it to `wal.rs`/`manifest.rs` and a
 seeded/reproducible harness; nothing built here needs to be redone, only
 extended.
 
+**Satisfied ahead of schedule:** Phase 13 was built before this phase (see
+`planning/README.md`'s status table) and already delivered more than this
+section's minimum ask — `FileSink`/`FaultyFile`/`FaultSchedule` (seeded,
+reproducible) wired into both `SstWriter` (flush) and `run_compaction_with_sink`
+(compaction). `storage/tests/faultsim_compaction.rs` is item 4's test:
+20 seeds, faults the merged output's `sync_all`, asserts every pre-existing
+input SSTable is byte-identical and still reads back correctly, and the
+MANIFEST never diverges. It faults the final `Sync` call rather than the
+literal "second block's `Write`" worded above, but proves the identical
+`DESIGN.md` §8 property. No new code needed for item 4.
+
 **Test:** start a compaction, budget the `FileSink` to fail partway through
 the *second* output block, assert `compact_all()` returns an `io::Error`
 (propagated, not swallowed), assert the `.tmp` output is either absent or
