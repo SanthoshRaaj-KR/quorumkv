@@ -83,7 +83,21 @@ type cluster struct {
 	nodes map[uint64]*clusterNode
 }
 
+// newCluster builds a cluster with the real, unmodified client-facing
+// protocol on every node.
 func newCluster(n int, seed int64) (*cluster, error) {
+	return buildCluster(n, seed, func(srv *consensus.Server, sm *memSM) http.Handler {
+		return clientrpc.NewServer(srv, sm, 2*time.Second).Handler()
+	})
+}
+
+// buildCluster is newCluster generalized over what serves the client-facing
+// HTTP protocol on each node. The real path (newCluster) always uses the
+// genuine clientrpc.Server; the mutation test (mutation_test.go, §5.3)
+// is the only other caller, substituting a deliberately buggy handler to
+// prove Check() actually catches a real violation instead of just agreeing
+// with itself on synthetic histories.
+func buildCluster(n int, seed int64, handlerFor func(srv *consensus.Server, sm *memSM) http.Handler) (*cluster, error) {
 	c := &cluster{nodes: make(map[uint64]*clusterNode)}
 	for i := 1; i <= n; i++ {
 		c.ids = append(c.ids, uint64(i))
@@ -119,7 +133,7 @@ func newCluster(n int, seed int64) (*cluster, error) {
 		if err != nil {
 			return nil, fmt.Errorf("linearize: client listener %d: %w", id, err)
 		}
-		httpSrv := &http.Server{Handler: clientrpc.NewServer(srv, sm, 2*time.Second).Handler()}
+		httpSrv := &http.Server{Handler: handlerFor(srv, sm)}
 		go httpSrv.Serve(ln)
 
 		c.nodes[id] = &clusterNode{
