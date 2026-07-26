@@ -31,6 +31,13 @@ type TCPTransport struct {
 	accepted map[net.Conn]struct{}
 	closed   bool
 
+	// isolated is Bus.Isolate's real-socket equivalent (planning/phase-12
+	// §1a): cuts this node off from every peer, bidirectionally. savedAddrs
+	// holds the address book Isolate found in place, so Heal can restore it
+	// without any external caller having to remember it.
+	isolated   bool
+	savedAddrs map[uint64]string
+
 	wg sync.WaitGroup
 }
 
@@ -129,6 +136,53 @@ func (t *TCPTransport) conn(peer uint64) (net.Conn, error) {
 	return c, nil
 }
 
+// Isolate cuts this node off from every peer, bidirectionally: it closes
+// every open connection (outbound and inbound), clears its address book so
+// Send can't redial, and its accept loop starts refusing new inbound
+// connections outright. This is TCPTransport's equivalent of Bus.Isolate,
+// promoted (planning/phase-12 §1a) from the ad hoc drop+SetPeers mechanism
+// tcpCluster's tests reconstructed by hand.
+func (t *TCPTransport) Isolate() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.isolated {
+		return
+	}
+	t.isolated = true
+	t.savedAddrs = t.addrs
+	t.addrs = make(map[uint64]string)
+	for id, c := range t.conns {
+		c.Close()
+		delete(t.conns, id)
+	}
+	// Closing each accepted connection is what unblocks its reader
+	// goroutine; it removes itself from t.accepted via its own defer.
+	for c := range t.accepted {
+		c.Close()
+	}
+}
+
+// Heal reverses Isolate, restoring the address book that was in place when
+// Isolate was called. Connections to peers are re-established lazily on the
+// next Send, same as any other post-drop redial.
+func (t *TCPTransport) Heal() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if !t.isolated {
+		return
+	}
+	t.isolated = false
+	t.addrs = t.savedAddrs
+	t.savedAddrs = nil
+}
+
+// IsIsolated reports whether Isolate has been called without a matching Heal.
+func (t *TCPTransport) IsIsolated() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.isolated
+}
+
 func (t *TCPTransport) drop(peer uint64) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -146,7 +200,7 @@ func (t *TCPTransport) accept() {
 			return // listener closed
 		}
 		t.mu.Lock()
-		if t.closed {
+		if t.closed || t.isolated {
 			t.mu.Unlock()
 			c.Close()
 			continue
