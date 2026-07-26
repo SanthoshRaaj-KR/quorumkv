@@ -1,6 +1,11 @@
 package linearize
 
-import "fmt"
+import (
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+)
 
 // Violation is the counterexample produced when a key's recorded history
 // admits no linearization consistent with real time — enough to reproduce
@@ -12,6 +17,43 @@ type Violation struct {
 
 func (v *Violation) Error() string {
 	return fmt.Sprintf("linearize: key %q: no valid linearization for %d recorded op(s)", v.Key, len(v.Ops))
+}
+
+// Dump renders every op in the violation, ordered by start time, with
+// enough detail (kind, arg/result, real-time interval, outcome) to
+// reconstruct why no linearization exists by hand — the same "give the
+// human what they need to reproduce it" instinct as a fault-injection seed
+// (planning/phase-13-fault-injection.md §1c).
+func (v *Violation) Dump() string {
+	ops := append([]Op(nil), v.Ops...)
+	sort.Slice(ops, func(i, j int) bool { return ops[i].Start.Before(ops[j].Start) })
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "key %q, %d op(s):\n", v.Key, len(ops))
+	for _, op := range ops {
+		outcome := "ok"
+		if !op.Ok {
+			outcome = "UNKNOWN (client saw an error/timeout)"
+		}
+		switch op.Kind {
+		case OpPut:
+			fmt.Fprintf(&b, "  [%s .. %s] PUT   arg=%q            (%s)\n", fmtT(op.Start), fmtT(op.End), op.Arg, outcome)
+		case OpDelete:
+			fmt.Fprintf(&b, "  [%s .. %s] DELETE                  (%s)\n", fmtT(op.Start), fmtT(op.End), outcome)
+		case OpGet:
+			fmt.Fprintf(&b, "  [%s .. %s] GET   result=%s   (%s)\n", fmtT(op.Start), fmtT(op.End), fmtValue(op.Result), outcome)
+		}
+	}
+	return b.String()
+}
+
+func fmtT(t time.Time) string { return t.Format("15:04:05.000000") }
+
+func fmtValue(v Value) string {
+	if !v.Found {
+		return "absent"
+	}
+	return fmt.Sprintf("%q", v.Data)
 }
 
 // Check reports whether h is linearizable. Decomposed key by key (§1a):
