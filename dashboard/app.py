@@ -47,6 +47,10 @@ PHASE_TITLES = {
     7: "Phase 7 — Leader election",
     8: "Phase 8 — Log replication",
     9: "Phase 9 — Snapshotting",
+    10: "Phase 10 — Connecting Raft to the LSM engine",
+    11: "Phase 11 — Client library",
+    13: "Phase 13 — Deterministic fault injection",
+    14: "Phase 14 — Linearizability verification",
 }
 
 # ─── discovery ────────────────────────────────────────────────────────────────
@@ -67,6 +71,14 @@ _GO_FILE_PHASES = {
     "tcp_test.go": (7, "Wire codec & real TCP transport"),
     "replication_test.go": (8, "Log replication over RPC"),
     "snapshot_test.go": (9, "Snapshotting & InstallSnapshot"),
+    "engine/command_test.go": (10, "Command encoding — the Raft <-> LSM seam"),
+    "engine/sidecar_integration_test.go": (10, "Real Rust sidecar integration (no mocks)"),
+    "proposeandwait_test.go": (11, "Server.ProposeAndWait — commit/apply wait, ErrProposalLost"),
+    "clientrpc/clientrpc_test.go": (11, "Client-facing HTTP RPC — redirect-following, election survival"),
+    "faultsim_test.go": (13, "Go-side fault injection — torn raft-log appends"),
+    "linearize/checker_test.go": (14, "Linearizability checker — adversarial known-good/known-bad histories"),
+    "linearize/cluster_test.go": (14, "Linearizability — real cluster integration run"),
+    "linearize/mutation_test.go": (14, "Linearizability — mutation test (checker catches a real injected bug)"),
 }
 
 
@@ -122,6 +134,9 @@ _RUST_INTEGRATION_PHASES = {
     "bloom_reads.rs": (4, "Bloom filter skips unnecessary reads"),
     "compaction_donewhen.rs": (5, "Compaction correctness (done-when)"),
     "compaction_safety.rs": (5, "Compaction safety under concurrency/crash"),
+    "faultsim_wal.rs": (13, "Deterministic fault injection — mid-WAL-append"),
+    "faultsim_sstable.rs": (13, "Deterministic fault injection — SSTable temp-write before rename"),
+    "faultsim_compaction.rs": (13, "Deterministic fault injection — mid-compaction"),
 }
 
 # src/*.rs inline unit tests — isolated via a `<module>::` substring filter
@@ -135,6 +150,8 @@ _RUST_UNIT_PHASES = {
     "manifest.rs": (5, "MANIFEST file-set tracking (unit)"),
     "merge.rs": (0, "Read-path merge across memtable/SSTables (unit)"),
     "db.rs": (0, "Db engine integration glue (unit)"),
+    "snapshot.rs": (10, "SSTable-set pack/unpack — the snapshot transfer blob (unit)"),
+    "faultsim.rs": (13, "FileSink fault-injection seam (unit)"),
 }
 
 
