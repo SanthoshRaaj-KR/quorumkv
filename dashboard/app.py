@@ -334,6 +334,71 @@ def run_suite(suite: dict) -> dict:
     return result
 
 
+# ─── the flagship linearizability benchmark ───────────────────────────────────
+#
+# planning/phase-14-linearizability.md §6.3 — deliberately excluded from the
+# suites above: it takes a few real minutes (a genuine 5-node cluster, real
+# induced leader kills, a real backtracking search over 150k+ recorded
+# operations) and is gated behind the `flagship` Go build tag for exactly
+# that reason (`go test ./...` never runs it by accident). This runs it the
+# same way a person would from a terminal, parses the numbers straight out
+# of what it actually printed, and caches the result — nothing here is a
+# canned or hand-typed figure.
+
+BENCHMARK_TIMEOUT = 18 * 60  # generous headroom over the ~3 real minutes this takes
+BENCHMARK_RESULT_PATH = Path(__file__).resolve().parent / "benchmark_result.json"
+
+# Matches flagship_test.go's own final t.Logf line exactly:
+#   RESULT: linearizability verified across 156577 operations under 2 induced
+#   leader failures (5-node cluster, 25 concurrent clients, 1m30.096s
+#   wall-clock, 1738 ops/sec)
+_BENCHMARK_RESULT_RE = re.compile(
+    r"RESULT: linearizability verified across (\d+) operations under (\d+) induced leader "
+    r"failures \((\d+)-node cluster, (\d+) concurrent clients, (.+?) wall-clock, ([\d.]+) ops/sec\)"
+)
+
+
+def run_benchmark() -> dict:
+    # -count=1 disables Go's test result cache (same reason run_go_suite uses
+    # it above) — without it, an unchanged package can make this return a
+    # stale cached PASS from a previous real run in well under a second,
+    # which is exactly what happened the first time this was wired up.
+    cmd = [
+        "go", "test", "-tags=flagship", "-run", "TestFlagship", "-v",
+        "-count=1", "-timeout", "15m", "./linearize/...",
+    ]
+    start = time.time()
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(CONSENSUS_DIR), capture_output=True, text=True, timeout=BENCHMARK_TIMEOUT
+        )
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "error": f"timed out after {BENCHMARK_TIMEOUT}s"}
+    except FileNotFoundError:
+        return {"ok": False, "error": "`go` executable not found on PATH"}
+    wall_s = time.time() - start
+
+    out = proc.stdout
+    m = _BENCHMARK_RESULT_RE.search(out)
+    if proc.returncode != 0 or not m:
+        tail = (out + "\n" + proc.stderr).strip()[-4000:]
+        return {"ok": False, "error": "benchmark did not pass", "output_tail": tail, "wall_s": wall_s}
+
+    result = {
+        "ok": True,
+        "operations": int(m.group(1)),
+        "leader_failures": int(m.group(2)),
+        "nodes": int(m.group(3)),
+        "clients": int(m.group(4)),
+        "workload_duration": m.group(5),
+        "ops_per_sec": float(m.group(6)),
+        "wall_s": round(wall_s, 1),
+        "verified_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    BENCHMARK_RESULT_PATH.write_text(json.dumps(result, indent=2))
+    return result
+
+
 # ─── live sandbox backend (Go) ────────────────────────────────────────────────
 #
 # The "run tests" side above works by shelling out per request. The live
@@ -414,6 +479,18 @@ def sandbox_page():
     return render_template("sandbox.html")
 
 
+@app.route("/api/benchmark/run", methods=["POST"])
+def api_benchmark_run():
+    return jsonify(run_benchmark())
+
+
+@app.route("/api/benchmark/last")
+def api_benchmark_last():
+    if BENCHMARK_RESULT_PATH.exists():
+        return jsonify(json.loads(BENCHMARK_RESULT_PATH.read_text(encoding="utf-8")))
+    return jsonify({"ok": False, "error": "no benchmark has been run yet"})
+
+
 @app.route("/api/sandbox/state")
 def sandbox_state():
     data, status = _sandbox_request("/state")
@@ -462,4 +539,8 @@ if __name__ == "__main__":
     # use_reloader=False: the watchdog reloader has been seen false-triggering
     # on unrelated stdlib file "changes" in this environment. Not needed for a
     # local dev tool anyway — just restart it after editing.
-    app.run(debug=True, port=5055, use_reloader=False)
+    # threaded=True: the flagship benchmark run blocks its own request for a
+    # few real minutes (§ above) — without this, Werkzeug's single-threaded
+    # dev server would freeze every other tab (the sandbox, other suite runs)
+    # for the whole duration.
+    app.run(debug=True, port=5055, use_reloader=False, threaded=True)
