@@ -1,0 +1,11 @@
+{
+  "ok": true,
+  "operations": 147626,
+  "leader_failures": 2,
+  "nodes": 5,
+  "clients": 25,
+  "workload_duration": "1m30.095s",
+  "ops_per_sec": 1639.0,
+  "wall_s": 168.4,
+  "verified_at": "2026-07-26T19:14:27+0530"
+}
