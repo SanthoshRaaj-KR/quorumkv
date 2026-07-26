@@ -14,18 +14,18 @@ import (
 func TestClusterRunIsLinearizableUnderLeaderCrash(t *testing.T) {
 	result, err := Run(RunConfig{
 		Nodes: 3, Keys: 15, Clients: 8,
-		Duration:   3 * time.Second,
-		KillLeader: true,
-		Seed:       1,
+		Duration:    3 * time.Second,
+		LeaderKills: 1,
+		Seed:        1,
 	})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	t.Logf("recorded %d ops; leader killed: node %d", result.History.Len(), result.LeaderKilled)
+	t.Logf("recorded %d ops; leaders killed: %v", result.History.Len(), result.LeaderKills)
 	if result.History.Len() < 50 {
 		t.Fatalf("workload barely ran: only %d ops recorded", result.History.Len())
 	}
-	if result.LeaderKilled == 0 {
+	if len(result.LeaderKills) == 0 {
 		t.Error("expected a leader kill to have completed during the run")
 	}
 

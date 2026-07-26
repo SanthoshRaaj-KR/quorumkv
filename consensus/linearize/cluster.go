@@ -204,12 +204,12 @@ func (c *cluster) killLeader() (uint64, error) {
 
 // RunConfig configures a fault-injected run against a real cluster (§4).
 type RunConfig struct {
-	Nodes      int           // cluster size (default 3)
-	Keys       int           // shared keyspace size clients contend over (default 20)
-	Clients    int           // concurrent client goroutines (default 10)
-	Duration   time.Duration // how long the workload runs (default 2s)
-	KillLeader bool          // kill the current leader partway through, once
-	Seed       int64         // op-selection randomness
+	Nodes       int           // cluster size (default 3)
+	Keys        int           // shared keyspace size clients contend over (default 20)
+	Clients     int           // concurrent client goroutines (default 10)
+	Duration    time.Duration // how long the workload runs (default 2s)
+	LeaderKills int           // how many times to kill the current leader across the run, evenly spaced (0 = none)
+	Seed        int64         // op-selection randomness
 }
 
 func (cfg RunConfig) withDefaults() RunConfig {
@@ -230,8 +230,8 @@ func (cfg RunConfig) withDefaults() RunConfig {
 
 // RunResult is what a fault-injected run produces.
 type RunResult struct {
-	History      *History
-	LeaderKilled uint64 // 0 if cfg.KillLeader was false or the kill never completed
+	History     *History
+	LeaderKills []uint64 // one entry per leader actually killed, in order
 }
 
 // Run drives cfg against a fresh real cluster: cfg.Clients goroutines issue
@@ -241,8 +241,15 @@ type RunResult struct {
 // exercises the checker; disjoint per-client keys would prove nothing) —
 // for cfg.Duration, through a real clientrpc.Client that finds the leader
 // and survives an election entirely on its own (Phase 11). If
-// cfg.KillLeader, a separate goroutine kills the current leader about a
-// third of the way through, in real time, while the workload keeps running.
+// cfg.LeaderKills > 0, a separate goroutine kills the current leader that
+// many times, evenly spaced across the run, while the workload keeps going.
+//
+// Kills are permanent (no restart) — this harness has no node-restart
+// machinery, so cfg.LeaderKills must stay low enough that a majority of
+// cfg.Nodes always survives (e.g. at most 1 of 3, at most 2 of 5); Run does
+// not itself enforce this, since the interesting failure if you get it
+// wrong — the cluster losing quorum and every write timing out — is a
+// legitimate (if unintended) thing to observe too.
 //
 // Every call's outcome — including failures and timeouts — is recorded
 // into the returned History (§4.3); an unacknowledged write is never
@@ -270,14 +277,22 @@ func Run(cfg RunConfig) (*RunResult, error) {
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
+	var resultMu sync.Mutex
 
-	if cfg.KillLeader {
+	if cfg.LeaderKills > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			time.Sleep(cfg.Duration / 3)
-			if id, err := c.killLeader(); err == nil {
-				result.LeaderKilled = id
+			interval := cfg.Duration / time.Duration(cfg.LeaderKills+1)
+			for i := 0; i < cfg.LeaderKills; i++ {
+				time.Sleep(interval)
+				id, err := c.killLeader()
+				if err != nil {
+					return // out of nodes to safely kill from, or the cluster's in trouble — stop trying
+				}
+				resultMu.Lock()
+				result.LeaderKills = append(result.LeaderKills, id)
+				resultMu.Unlock()
 			}
 		}()
 	}

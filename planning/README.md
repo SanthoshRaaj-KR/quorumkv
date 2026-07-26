@@ -36,7 +36,7 @@ Every phase file has the same shape:
 | 11 | [phase-11-client.md](phase-11-client.md) | Usable from outside | **built** ✅ |
 | 12 | [phase-12-chaos.md](phase-12-chaos.md) | Prove it under failure | **planned** — decisions locked, signed off, not yet built |
 | 13 | [phase-13-fault-injection.md](phase-13-fault-injection.md) | Deterministic storage-level fault injection | **built** ✅ (drafted and built ahead of 12) |
-| 14 | [phase-14-linearizability.md](phase-14-linearizability.md) | Prove linearizability, don't just claim it | **planned** — decisions locked, not yet built (revives Phase 12 item 5, previously skipped) |
+| 14 | [phase-14-linearizability.md](phase-14-linearizability.md) | Prove linearizability, don't just claim it | **built** ✅ — 156,577 ops verified under 2 induced leader failures |
 
 ## Decision log
 
@@ -100,6 +100,7 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Fault-injection seam shape | 13 | `FileSink` trait (Rust) wraps write+sync only; Go gets a narrower single-call-site mirror (`FileStorage.AppendEntries` only — its one file handle serves too many purposes to wrap wholesale) | locked, built |
 | Fault-injection reproducibility | 13 | every fault is seed-derived; hand-rolled SplitMix64 PRNG on both sides, not the `rand` crate (Windows-gnu linking risk, same class of problem as Phase 10 §1) | locked, built |
 | Fault-injection scenarios | 13 | mid-WAL-append, SSTable temp-write-before-rename, mid-compaction — all three built and tested over 20 seeds each | locked, built |
-| Linearizability decomposition | 14 | check each key's history independently (compositionality) rather than one global-object search | locked |
-| Linearizability search algorithm | 14 | hand-rolled backtracking per key, not a ported Porcupine/Knossos | locked |
-| Linearizability dependency on Phase 12 | 14 | none — standalone harness reusing Phase 11's cluster/client; Phase 12 can reuse this checker later | locked |
+| Linearizability decomposition | 14 | check each key's history independently (compositionality) rather than one global-object search | locked, built |
+| Linearizability search algorithm | 14 | hand-rolled backtracking per key, not a ported Porcupine/Knossos | locked, built |
+| Linearizability dependency on Phase 12 | 14 | none — standalone harness reusing Phase 11's cluster/client; Phase 12 can reuse this checker later | locked, built |
+| Flagship benchmark gating | 14 | Go build tag (`flagship`), not `testing.Short()` — `go test ./...` doesn't pass `-short` by default, so only a build tag actually keeps it out of a normal run | locked, built |
