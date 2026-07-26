@@ -23,6 +23,68 @@
 
 * { box-sizing: border-box; }
 
+/* ─── highlights / benchmark panel ─────────────────────────────────────── */
+
+.highlights {
+  margin: 20px 24px 0;
+  padding: 18px 20px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.highlights-head { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 14px; }
+.highlights-head h2 { margin: 0; font-size: 1.05rem; }
+.highlights-head .hint { color: var(--muted); font-size: 0.85rem; }
+
+.stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+
+.stat-tile {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px 14px;
+  background: var(--bg);
+}
+
+.stat-tile .stat-value {
+  font-size: 1.6rem;
+  font-weight: 600;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-tile .stat-label { color: var(--muted); font-size: 0.82rem; margin-top: 2px; }
+.stat-tile.pending .stat-value { color: var(--muted); }
+.stat-tile.fail .stat-value { color: var(--fail); }
+.stat-tile.fail .stat-label { color: var(--fail); }
+
+.highlights-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
+  flex-wrap: wrap;
+}
+
+.highlights-foot .hint { color: var(--muted); font-size: 0.82rem; }
+
+#reverify-btn {
+  background: var(--accent);
+  color: #0b0d11;
+  border: none;
+  border-radius: 6px;
+  padding: 8px 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+#reverify-btn:disabled { opacity: 0.6; cursor: default; }
+
 body {
   margin: 0;
   background: var(--bg);

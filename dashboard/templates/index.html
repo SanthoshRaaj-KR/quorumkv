@@ -11,6 +11,23 @@
     <p class="sub">Runs the real suites — <code>cargo test</code> for the LSM storage engine, <code>go test</code> for the Raft consensus layer — grouped by phase. Nothing here is mocked. Want to drive a live cluster by hand instead? <a href="/sandbox">Open the live sandbox →</a></p>
   </header>
 
+  <section class="highlights" id="highlights">
+    <div class="highlights-head">
+      <h2>Highlights</h2>
+      <span class="hint">Phase 14's flagship linearizability run — a real 5-node cluster, real induced leader crashes, checked with a from-scratch Porcupine-style checker. Not a mock, not a canned number.</span>
+    </div>
+    <div class="stat-grid" id="stat-grid">
+      <div class="stat-tile pending">
+        <div class="stat-value">—</div>
+        <div class="stat-label">loading…</div>
+      </div>
+    </div>
+    <div class="highlights-foot">
+      <span id="highlights-meta" class="hint"></span>
+      <button id="reverify-btn" onclick="runBenchmark()">Re-verify now (~3 min, real run)</button>
+    </div>
+  </section>
+
   <main class="columns">
     <section class="engine" data-engine-section="rust">
       <div class="engine-head">
@@ -48,5 +65,53 @@
   </main>
 
   <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script>
+    function renderStats(d) {
+      const grid = document.getElementById("stat-grid");
+      const meta = document.getElementById("highlights-meta");
+
+      if (!d || !d.ok) {
+        grid.innerHTML = `
+          <div class="stat-tile pending"><div class="stat-value">—</div><div class="stat-label">not yet verified this session</div></div>
+        `;
+        meta.textContent = d && d.error && d.error !== "no benchmark has been run yet"
+          ? "Last attempt: " + d.error : "Click “Re-verify now” to run it for real.";
+        return;
+      }
+
+      grid.innerHTML = `
+        <div class="stat-tile"><div class="stat-value">${d.operations.toLocaleString()}</div><div class="stat-label">operations verified linearizable</div></div>
+        <div class="stat-tile"><div class="stat-value">${d.ops_per_sec.toLocaleString()}</div><div class="stat-label">ops/sec sustained</div></div>
+        <div class="stat-tile"><div class="stat-value">${d.leader_failures}</div><div class="stat-label">induced leader failures survived</div></div>
+        <div class="stat-tile"><div class="stat-value">${d.nodes}-node</div><div class="stat-label">cluster, ${d.clients} concurrent clients</div></div>
+      `;
+      meta.textContent = `Last verified ${new Date(d.verified_at).toLocaleString()} — real run, ${d.workload_duration} workload + check, took ${Math.round(d.wall_s)}s total.`;
+    }
+
+    async function loadStats() {
+      const res = await fetch("/api/benchmark/last");
+      renderStats(await res.json());
+    }
+
+    async function runBenchmark() {
+      const btn = document.getElementById("reverify-btn");
+      const meta = document.getElementById("highlights-meta");
+      btn.disabled = true;
+      const start = Date.now();
+      const timer = setInterval(() => {
+        meta.textContent = `Running a real 5-node cluster under induced leader failures... ${Math.round((Date.now() - start) / 1000)}s elapsed (takes about 3 minutes).`;
+      }, 1000);
+
+      try {
+        const res = await fetch("/api/benchmark/run", { method: "POST" });
+        renderStats(await res.json());
+      } finally {
+        clearInterval(timer);
+        btn.disabled = false;
+      }
+    }
+
+    document.addEventListener("DOMContentLoaded", loadStats);
+  </script>
 </body>
 </html>
