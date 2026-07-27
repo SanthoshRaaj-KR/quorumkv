@@ -79,7 +79,15 @@ impl Db {
         if !had_manifest {
             let existing = list_sstables(&dir)?;
             if !existing.is_empty() {
-                let added = existing.iter().map(|(n, _)| FileMeta { number: *n, level: 0 }).collect();
+                // No SstWriter was around for these files to capture their
+                // range for free (phase-05 §8 A2) — read each one's own
+                // sparse index to recover it, a one-time cost paid only when
+                // adopting a pre-MANIFEST directory.
+                let mut added = Vec::with_capacity(existing.len());
+                for (n, path) in &existing {
+                    let (min_key, max_key) = SstReader::open(path)?.key_range()?;
+                    added.push(FileMeta { number: *n, level: 0, min_key, max_key });
+                }
                 versions.commit(&VersionEdit { added, deleted: Vec::new() })?;
             }
         }
@@ -365,8 +373,8 @@ impl Db {
         // Flush to a new SSTable (VersionSet-allocated number), then commit the add.
         let sst_number = self.versions.next_file_number();
         let output = write_sstable(&self.dir, sst_number, sealed.iter(), sealed.len(), self.bits_per_key)?;
-        if output.is_some() {
-            self.versions.commit(&VersionEdit::add(sst_number, 0))?;
+        if let Some((_, min_key, max_key)) = output {
+            self.versions.commit(&VersionEdit::add(sst_number, 0, min_key, max_key))?;
         }
 
         // Publish the SSTable in the read view, then drop the sealed immutable.

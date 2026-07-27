@@ -36,7 +36,7 @@ fn failed_sync_aborts_before_rename_leaves_prior_state_untouched_and_sweeps_clea
 
         // A pre-existing, already-committed SSTable — the "prior state" the
         // scenario cares about not corrupting.
-        let prior_path =
+        let (prior_path, _, _) =
             write_sstable(&dir.0, 1, entries("prior", 10), 10, BPK).unwrap().unwrap();
 
         // The faulted attempt: SstWriter::finish makes exactly one sync_all

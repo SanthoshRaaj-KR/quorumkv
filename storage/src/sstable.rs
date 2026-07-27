@@ -325,7 +325,14 @@ pub struct SstWriter {
     /// Accumulated sparse index (one entry per completed block).
     index: Vec<u8>,
     entry_count: u64,
-    /// Last key added, for the strictly-increasing debug assertion.
+    /// First key added — since keys arrive strictly increasing, this is the
+    /// file's minimum key (planning/phase-05-compaction.md §8 A2: the
+    /// MANIFEST needs a key range per file for leveled compaction's overlap
+    /// checks). Captured for free from the writer's own invariant, no
+    /// separate scan needed.
+    first_key: Option<Vec<u8>>,
+    /// Last key added, for the strictly-increasing debug assertion — and,
+    /// doubling as the file's maximum key for the same reason as above.
     last_key: Option<Vec<u8>>,
     /// Bloom filter built as keys stream through (every key, Put and Delete).
     bloom: BloomFilter,
@@ -364,6 +371,7 @@ impl SstWriter {
             block_first_key: None,
             index: Vec::new(),
             entry_count: 0,
+            first_key: None,
             last_key: None,
             bloom: BloomFilter::new(num_keys, bits_per_key),
         })
@@ -381,6 +389,9 @@ impl SstWriter {
         // bloom-skip would resurrect a deleted key (phase-04 §1).
         self.bloom.insert(key);
 
+        if self.first_key.is_none() {
+            self.first_key = Some(key.to_vec());
+        }
         if self.block.is_empty() {
             self.block_first_key = Some(key.to_vec());
         }
@@ -413,11 +424,13 @@ impl SstWriter {
     }
 
     /// Finish: flush the last block, write the index and footer, fsync, atomically
-    /// rename `.tmp` → `.sst`, fsync the directory, and return the final path.
+    /// rename `.tmp` → `.sst`, fsync the directory, and return the final path
+    /// plus the file's `(min_key, max_key)` — the range the MANIFEST records
+    /// for leveled compaction's overlap checks (phase-05 §8 A2).
     ///
     /// Panics in debug builds if no entries were added — callers must not flush an
     /// empty memtable (use [`write_sstable`], which skips empties).
-    pub fn finish(mut self) -> io::Result<PathBuf> {
+    pub fn finish(mut self) -> io::Result<(PathBuf, Vec<u8>, Vec<u8>)> {
         debug_assert!(self.entry_count > 0, "refusing to write a 0-entry SSTable");
 
         self.flush_block()?;
@@ -450,7 +463,9 @@ impl SstWriter {
             self.entry_count,
             self.index_entry_count(),
         );
-        Ok(self.final_path)
+        let min_key = self.first_key.expect("a non-empty SSTable has a first key");
+        let max_key = self.last_key.expect("a non-empty SSTable has a last key");
+        Ok((self.final_path, min_key, max_key))
     }
 
     /// Number of blocks written (index entries), for logging.
@@ -473,15 +488,15 @@ impl SstWriter {
 /// Flush a sorted entry stream to one SSTable under `dir`, or skip it.
 ///
 /// `num_keys` sizes the Bloom filter (the memtable's entry count). Returns
-/// `Ok(Some(path))` for a written file, or `Ok(None)` if `entries` was empty (we
-/// never write a 0-entry SSTable — phase-03 §5).
+/// `Ok(Some((path, min_key, max_key)))` for a written file, or `Ok(None)` if
+/// `entries` was empty (we never write a 0-entry SSTable — phase-03 §5).
 pub fn write_sstable<I>(
     dir: &Path,
     file_number: u64,
     entries: I,
     num_keys: usize,
     bits_per_key: u32,
-) -> io::Result<Option<PathBuf>>
+) -> io::Result<Option<(PathBuf, Vec<u8>, Vec<u8>)>>
 where
     I: IntoIterator<Item = (Vec<u8>, Value)>,
 {
@@ -501,7 +516,7 @@ pub fn write_sstable_with_sink<I>(
     num_keys: usize,
     bits_per_key: u32,
     make_sink: impl FnOnce(File) -> Box<dyn FileSink>,
-) -> io::Result<Option<PathBuf>>
+) -> io::Result<Option<(PathBuf, Vec<u8>, Vec<u8>)>>
 where
     I: IntoIterator<Item = (Vec<u8>, Value)>,
 {
@@ -655,6 +670,26 @@ impl SstReader {
     /// The file this reader was opened from.
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// `(min_key, max_key)` for this file, derived from the sparse index
+    /// already loaded in RAM (min: the first block's first key) plus one
+    /// extra block read for the max (the last block's last key). Only used
+    /// to adopt a pre-MANIFEST directory's SSTables (`Db::open`), where no
+    /// [`SstWriter`] was around to capture the range for free — every other
+    /// path gets it from [`SstWriter::finish`] at zero extra cost.
+    pub fn key_range(&self) -> io::Result<(Vec<u8>, Vec<u8>)> {
+        let min_key = self.index.first().expect("a valid SSTable has a non-empty index").first_key.clone();
+        let last = self.index.last().expect("a valid SSTable has a non-empty index");
+        let block = self.read_block(last.offset, last.len)?;
+        let mut off = 0usize;
+        let mut max_key = Vec::new();
+        while off < block.len() {
+            let (k, _v, consumed) = decode_entry(&block[off..]).map_err(to_io)?;
+            off += consumed;
+            max_key = k;
+        }
+        Ok((min_key, max_key))
     }
 }
 
@@ -890,7 +925,7 @@ mod tests {
 
     fn write_and_read(dir: &TempDir, num: u64, entries: Vec<(Vec<u8>, Value)>) -> (Vec<(Vec<u8>, Value)>, usize, PathBuf) {
         let n = entries.len();
-        let path = write_sstable(&dir.0, num, entries, n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
+        let (path, _min, _max) = write_sstable(&dir.0, num, entries, n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
         let bytes = std::fs::read(&path).unwrap();
         let (parsed, blocks) = parse_sst(&bytes);
         (parsed, blocks, path)
@@ -912,9 +947,10 @@ mod tests {
     #[test]
     fn no_tmp_file_remains_after_write() {
         let dir = TempDir::new();
-        let path = write_sstable(&dir.0, 7, vec![(b"k".to_vec(), Value::Put(b"v".to_vec()))], 1, DEFAULT_BITS_PER_KEY)
+        let (path, min_key, max_key) = write_sstable(&dir.0, 7, vec![(b"k".to_vec(), Value::Put(b"v".to_vec()))], 1, DEFAULT_BITS_PER_KEY)
             .unwrap()
             .unwrap();
+        assert_eq!((min_key, max_key), (b"k".to_vec(), b"k".to_vec()));
         assert!(path.exists());
         assert_eq!(path.file_name().unwrap(), "000007.sst");
         assert!(!dir.0.join("000007.sst.tmp").exists());
@@ -956,6 +992,22 @@ mod tests {
     }
 
     #[test]
+    fn finish_reports_min_and_max_key_spanning_multiple_blocks() {
+        // phase-05 §8 A2: the MANIFEST needs a per-file key range. Since keys
+        // arrive strictly increasing, the first and last add()'d keys are it —
+        // this must hold even when they land in different blocks.
+        let dir = TempDir::new();
+        let entries: Vec<_> = (0..100u32)
+            .map(|i| (format!("key{i:05}").into_bytes(), Value::Put(vec![b'x'; 180])))
+            .collect();
+        let n = entries.len();
+        let (_, min_key, max_key) =
+            write_sstable(&dir.0, 1, entries.clone(), n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
+        assert_eq!(min_key, entries.first().unwrap().0);
+        assert_eq!(max_key, entries.last().unwrap().0);
+    }
+
+    #[test]
     fn tombstones_are_persisted() {
         let dir = TempDir::new();
         let entries = vec![
@@ -990,7 +1042,7 @@ mod tests {
 
     fn write_reader(dir: &TempDir, num: u64, entries: Vec<(Vec<u8>, Value)>) -> SstReader {
         let n = entries.len();
-        let path = write_sstable(&dir.0, num, entries, n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
+        let (path, _min, _max) = write_sstable(&dir.0, num, entries, n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
         SstReader::open(path).unwrap()
     }
 
@@ -1122,7 +1174,7 @@ mod tests {
             .map(|i| (format!("k{i:05}").into_bytes(), Value::Put(format!("v{i}").into_bytes())))
             .collect();
         let n = entries.len();
-        let path = write_sstable(&dir.0, 1, entries.clone(), n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
+        let (path, _min, _max) = write_sstable(&dir.0, 1, entries.clone(), n, DEFAULT_BITS_PER_KEY).unwrap().unwrap();
 
         // Corrupt a byte inside the on-disk Bloom block.
         let mut bytes = std::fs::read(&path).unwrap();

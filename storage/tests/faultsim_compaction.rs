@@ -21,8 +21,8 @@ const BPK: u32 = 10;
 fn add_sst(dir: &TempDir, vs: &VersionSet, entries: Vec<(Vec<u8>, Value)>) -> u64 {
     let num = vs.next_file_number();
     let n = entries.len();
-    write_sstable(&dir.0, num, entries, n, BPK).unwrap().unwrap();
-    vs.commit(&VersionEdit::add(num, 0)).unwrap();
+    let (_, min_key, max_key) = write_sstable(&dir.0, num, entries, n, BPK).unwrap().unwrap();
+    vs.commit(&VersionEdit::add(num, 0, min_key, max_key)).unwrap();
     num
 }
 

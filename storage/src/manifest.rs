@@ -25,11 +25,17 @@ use crate::wal::{fsync_dir, parent_dir};
 /// The MANIFEST filename within a store directory.
 pub const MANIFEST_NAME: &str = "MANIFEST";
 
-/// Metadata for one live SSTable: its file number and its level.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Metadata for one live SSTable: its file number, its level, and its key
+/// range. The range (planning/phase-05-compaction.md §8 A2) is what leveled
+/// compaction needs for overlap checks — at most one file per non-L0 level
+/// may cover any given key. Not `Copy`: `min_key`/`max_key` are owned byte
+/// strings, arbitrary length like every key elsewhere in this crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileMeta {
     pub number: u64,
     pub level: u32,
+    pub min_key: Vec<u8>,
+    pub max_key: Vec<u8>,
 }
 
 /// One atomic change to the live set: files to add and files to remove.
@@ -40,9 +46,9 @@ pub struct VersionEdit {
 }
 
 impl VersionEdit {
-    /// A single-file add (a flush output).
-    pub fn add(number: u64, level: u32) -> Self {
-        VersionEdit { added: vec![FileMeta { number, level }], deleted: Vec::new() }
+    /// A single-file add (a flush or compaction output) with its key range.
+    pub fn add(number: u64, level: u32, min_key: Vec<u8>, max_key: Vec<u8>) -> Self {
+        VersionEdit { added: vec![FileMeta { number, level, min_key, max_key }], deleted: Vec::new() }
     }
 }
 
@@ -187,6 +193,10 @@ fn encode_edit(edit: &VersionEdit) -> Vec<u8> {
     for f in &edit.added {
         payload.extend_from_slice(&f.number.to_le_bytes());
         payload.extend_from_slice(&f.level.to_le_bytes());
+        payload.extend_from_slice(&(f.min_key.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&f.min_key);
+        payload.extend_from_slice(&(f.max_key.len() as u32).to_le_bytes());
+        payload.extend_from_slice(&f.max_key);
     }
     payload.extend_from_slice(&(edit.deleted.len() as u32).to_le_bytes());
     for n in &edit.deleted {
@@ -223,7 +233,9 @@ fn decode_edit(buf: &[u8]) -> Result<(VersionEdit, usize), ManifestError> {
     for _ in 0..added_count {
         let number = read_u64(p, &mut off)?;
         let level = read_u32(p, &mut off)?;
-        added.push(FileMeta { number, level });
+        let min_key = read_bytes(p, &mut off)?;
+        let max_key = read_bytes(p, &mut off)?;
+        added.push(FileMeta { number, level, min_key, max_key });
     }
     let deleted_count = read_u32(p, &mut off)?;
     let mut deleted = Vec::with_capacity(deleted_count as usize);
@@ -247,6 +259,16 @@ fn read_u64(buf: &[u8], off: &mut usize) -> Result<u64, ManifestError> {
     Ok(u64::from_le_bytes(slice.try_into().unwrap()))
 }
 
+/// Read a `u32`-length-prefixed byte string (a key), the same shape
+/// `sstable.rs`'s own entry codec uses.
+fn read_bytes(buf: &[u8], off: &mut usize) -> Result<Vec<u8>, ManifestError> {
+    let len = read_u32(buf, off)? as usize;
+    let end = off.checked_add(len).ok_or(ManifestError::Malformed)?;
+    let slice = buf.get(*off..end).ok_or(ManifestError::Malformed)?;
+    *off = end;
+    Ok(slice.to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +278,18 @@ mod tests {
         let mut n = v.file_numbers();
         n.sort_unstable();
         n
+    }
+
+    /// A single-point key range derived from the file number — most of these
+    /// tests only care about file identity, not real ranges.
+    fn key(n: u64) -> Vec<u8> {
+        format!("k{n:04}").into_bytes()
+    }
+
+    /// `VersionEdit::add` with a synthetic range, for tests that don't care
+    /// what it is.
+    fn add(number: u64, level: u32) -> VersionEdit {
+        VersionEdit::add(number, level, key(number), key(number))
     }
 
     #[test]
@@ -271,8 +305,8 @@ mod tests {
     fn commit_adds_files_to_the_current_version() {
         let dir = TempDir::new();
         let vs = VersionSet::open(&dir.0).unwrap();
-        vs.commit(&VersionEdit::add(1, 0)).unwrap();
-        vs.commit(&VersionEdit::add(2, 0)).unwrap();
+        vs.commit(&add(1, 0)).unwrap();
+        vs.commit(&add(2, 0)).unwrap();
         assert_eq!(nums(&vs.current()), vec![1, 2]);
     }
 
@@ -280,11 +314,11 @@ mod tests {
     fn multi_file_edit_is_atomic() {
         let dir = TempDir::new();
         let vs = VersionSet::open(&dir.0).unwrap();
-        vs.commit(&VersionEdit::add(1, 0)).unwrap();
-        vs.commit(&VersionEdit::add(2, 0)).unwrap();
+        vs.commit(&add(1, 0)).unwrap();
+        vs.commit(&add(2, 0)).unwrap();
         // A compaction: delete inputs {1,2}, add output {3}, as one edit.
         vs.commit(&VersionEdit {
-            added: vec![FileMeta { number: 3, level: 1 }],
+            added: vec![FileMeta { number: 3, level: 1, min_key: key(1), max_key: key(2) }],
             deleted: vec![1, 2],
         })
         .unwrap();
@@ -296,8 +330,8 @@ mod tests {
         let dir = TempDir::new();
         {
             let vs = VersionSet::open(&dir.0).unwrap();
-            vs.commit(&VersionEdit::add(1, 0)).unwrap();
-            vs.commit(&VersionEdit::add(2, 0)).unwrap();
+            vs.commit(&add(1, 0)).unwrap();
+            vs.commit(&add(2, 0)).unwrap();
             vs.commit(&VersionEdit { added: vec![], deleted: vec![1] }).unwrap();
         }
         let vs = VersionSet::open(&dir.0).unwrap();
@@ -311,17 +345,17 @@ mod tests {
         let dir = TempDir::new();
         {
             let vs = VersionSet::open(&dir.0).unwrap();
-            vs.commit(&VersionEdit::add(1, 0)).unwrap();
-            vs.commit(&VersionEdit::add(2, 0)).unwrap();
+            vs.commit(&add(1, 0)).unwrap();
+            vs.commit(&add(2, 0)).unwrap();
         }
         // Append a half-written edit record, as a crash mid-commit would.
-        let partial = encode_edit(&VersionEdit::add(3, 0));
+        let partial = encode_edit(&add(3, 0));
         crate::testutil::append_raw(&dir.0.join(MANIFEST_NAME), &partial[..partial.len() - 2]);
 
         let vs = VersionSet::open(&dir.0).unwrap();
         assert_eq!(nums(&vs.current()), vec![1, 2]); // torn edit dropped
         // And the tail was healed: a new commit survives a further reopen.
-        vs.commit(&VersionEdit::add(4, 0)).unwrap();
+        vs.commit(&add(4, 0)).unwrap();
         drop(vs);
         let vs = VersionSet::open(&dir.0).unwrap();
         assert_eq!(nums(&vs.current()), vec![1, 2, 4]);
@@ -330,7 +364,10 @@ mod tests {
     #[test]
     fn edit_round_trips_through_codec() {
         let edit = VersionEdit {
-            added: vec![FileMeta { number: 7, level: 2 }, FileMeta { number: 9, level: 0 }],
+            added: vec![
+                FileMeta { number: 7, level: 2, min_key: b"aaa".to_vec(), max_key: b"mmm".to_vec() },
+                FileMeta { number: 9, level: 0, min_key: b"zzz".to_vec(), max_key: b"zzz".to_vec() },
+            ],
             deleted: vec![3, 4, 5],
         };
         let bytes = encode_edit(&edit);

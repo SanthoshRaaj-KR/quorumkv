@@ -125,8 +125,8 @@ pub fn run_compaction_with_sink(
 
     // One atomic edit: remove inputs, add the output (if any).
     let mut edit = VersionEdit { added: Vec::new(), deleted: compaction.inputs.clone() };
-    if output.is_some() {
-        edit.added.push(FileMeta { number: out_number, level: compaction.output_level });
+    if let Some((_, min_key, max_key)) = output {
+        edit.added.push(FileMeta { number: out_number, level: compaction.output_level, min_key, max_key });
     }
     versions.commit(&edit)?;
 
@@ -140,7 +140,7 @@ pub fn run_compaction_with_sink(
         target: "compaction",
         "compaction done: {} -> {}",
         compaction.inputs.len(),
-        if output.is_some() { "1 file" } else { "0 files (all dropped)" },
+        if edit.added.is_empty() { "0 files (all dropped)" } else { "1 file" },
     );
     Ok(())
 }
@@ -163,8 +163,8 @@ mod tests {
     fn add_sst(dir: &TempDir, vs: &VersionSet, entries: Vec<(Vec<u8>, Value)>) -> u64 {
         let num = vs.next_file_number();
         let n = entries.len();
-        write_sstable(&dir.0, num, entries, n, BPK).unwrap().unwrap();
-        vs.commit(&VE::add(num, 0)).unwrap();
+        let (_, min_key, max_key) = write_sstable(&dir.0, num, entries, n, BPK).unwrap().unwrap();
+        vs.commit(&VE::add(num, 0, min_key, max_key)).unwrap();
         num
     }
 
@@ -176,12 +176,19 @@ mod tests {
             .sum()
     }
 
+    /// A `FileMeta` with a synthetic single-point range, for tests that only
+    /// care about which files got picked, not real overlap behavior.
+    fn meta(number: u64, level: u32) -> FileMeta {
+        let k = format!("k{number:04}").into_bytes();
+        FileMeta { number, level, min_key: k.clone(), max_key: k }
+    }
+
     #[test]
     fn size_tiered_picks_when_enough_files() {
         let s = SizeTiered { min_run: 3 };
-        let few = vec![FileMeta { number: 1, level: 0 }, FileMeta { number: 2, level: 0 }];
+        let few = vec![meta(1, 0), meta(2, 0)];
         assert!(s.pick(&few).is_none());
-        let many: Vec<_> = (1..=3).map(|n| FileMeta { number: n, level: 0 }).collect();
+        let many: Vec<_> = (1..=3).map(|n| meta(n, 0)).collect();
         let c = s.pick(&many).unwrap();
         assert_eq!(c.inputs, vec![3, 2, 1]); // newest first
         assert!(c.is_bottom_most);
