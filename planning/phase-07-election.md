@@ -75,12 +75,21 @@ Three reasons:
    nothing and keeps one codec to reason about.
 
 The honest counter-argument: gRPC is the more resume-credible answer, and
-`DESIGN.md` §9 names `rpc.go`. That's why this is **flagged for sign-off** rather
-than quietly locked — the decision below is provisional, and swapping it is a
-one-file change by construction.
+`DESIGN.md` §9 names `rpc.go`. That's why this was **flagged for sign-off**
+rather than quietly locked — the decision below stood provisional until it
+could be ratified rather than just defaulted into.
 
-**PROVISIONAL: own TCP transport with CRC32C length-prefixed frames. gRPC
-remains the stated target, deferred to a later pass behind `Transport`.**
+**LOCKED, signed off (2026-07-27):** own TCP transport with CRC32C
+length-prefixed frames, kept as the permanent wire choice, not a placeholder.
+gRPC remains mechanically blocked on this machine (`protoc` /
+`protoc-gen-go` / `protoc-gen-go-grpc` are not installed, same constraint
+noted in Phase 10's boundary decision) and reintroducing it would mean
+~40 transitive dependencies and a codegen step for a done-when that only
+asks for "exactly one leader, survives a kill." The `Transport` interface
+(Phase 6) still makes a future gRPC implementation a one-file addition
+alongside `TCPTransport`, not a rewrite — the deferral costs nothing, so
+there is no reason to pay gRPC's cost now on the strength of resume value
+alone.
 
 ### Two transports, not one
 
@@ -240,7 +249,7 @@ has something to read. No membership change, ever.
 |---|---|
 | Real time | a `Server` loop outside `Node`; one goroutine owns the `Driver` |
 | Tick | 10 ms; election 15 ticks → [150 ms, 300 ms); heartbeat 5 ticks (50 ms) |
-| Wire | **PROVISIONAL** — own TCP + CRC32C length-prefixed frames; gRPC deferred behind `Transport` (deviates from ROADMAP; flagged for sign-off) |
+| Wire | own TCP + CRC32C length-prefixed frames; gRPC deferred behind `Transport` (deviates from ROADMAP; **signed off 2026-07-27**) |
 | Transports | ship two: deterministic `Loopback` + real `TCPTransport` |
 | Message loss | fire-and-forget; drop on unreachable, lazy redial, no queue |
 | Heartbeat | resets the election timer even on log mismatch; commit advances only on match |
@@ -272,6 +281,8 @@ Two things worth carrying forward:
   `matchIndex` ever advances and the general commit rule correctly refuses to
   commit anything — including the leader's own no-op. That is honest for an
   election-only phase; Phase 8 is what makes `matchIndex` move.
-- **gRPC is still owed.** The wire decision in §2 is PROVISIONAL and awaiting
-  sign-off. `TCPTransport` implements `Transport` in one file with no Raft code
-  in it, so the swap stays mechanical.
+- **gRPC was owed, now settled.** The wire decision in §2 is signed off
+  (2026-07-27) as the permanent choice, not a placeholder. `TCPTransport`
+  still implements `Transport` in one file with no Raft code in it, so a
+  future gRPC implementation — if the toolchain constraint ever lifts —
+  stays a mechanical addition, not a rewrite.

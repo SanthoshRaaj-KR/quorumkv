@@ -29,7 +29,7 @@ Every phase file has the same shape:
 | 4 | [phase-04-bloom.md](phase-04-bloom.md) | Skip files you don't need | decisions locked |
 | 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | locked; **§8 carry-forward** (leveled + bg thread unshipped) |
 | 6 | [phase-06-raft-single.md](phase-06-raft-single.md) | Raft state machine, isolated | **built** ✅ |
-| 7 | [phase-07-election.md](phase-07-election.md) | Leader election over RPC | **built** ✅ (wire choice provisional — §2) |
+| 7 | [phase-07-election.md](phase-07-election.md) | Leader election over RPC | **built** ✅ |
 | 8 | [phase-08-replication.md](phase-08-replication.md) | Agree on one ordered log | **built** ✅ |
 | 9 | phase-09-snapshot.md | Stop the log growing forever | **built** ✅ |
 | 10 | [phase-10-apply-seam.md](phase-10-apply-seam.md) | Connect Raft `apply` → LSM | **built** ✅ |
@@ -76,7 +76,7 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Raft apply seam | 6 | `StateMachine{Apply([]byte)}`; opaque command bytes | locked |
 | Real time | 7 | `Server` loop outside `Node`; one goroutine owns the `Driver` | locked |
 | Tick granularity | 7 | 10ms tick; election 15 ticks → [150,300)ms; heartbeat 5 ticks | locked |
-| **Wire format** | 7 | **own TCP + CRC32C frames; gRPC deferred behind `Transport`** | **PROVISIONAL — deviates from ROADMAP, needs sign-off** |
+| **Wire format** | 7 | **own TCP + CRC32C frames; gRPC deferred behind `Transport`** | deviates from ROADMAP; **signed off 2026-07-27** — permanent choice, not a placeholder; gRPC still toolchain-blocked (`protoc` not installed), `Transport` keeps a future swap mechanical |
 | Transports | 7 | ship two: deterministic `Loopback`/`Bus` + real `TCPTransport` | locked |
 | Message loss | 7 | fire-and-forget; drop on unreachable, lazy redial, no queue | locked |
 | Heartbeat semantics | 7 | resets election timer even on log mismatch; commit only on match | locked |
