@@ -22,7 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::bloom::DEFAULT_BITS_PER_KEY;
-use crate::compaction::{run_compaction, CompactionStrategy, SizeTiered};
+use crate::compaction::{run_compaction, CompactionStrategy, Leveled};
 use crate::manifest::{FileMeta, VersionEdit, VersionSet, MANIFEST_NAME};
 use crate::memtable::{Memtable, Value, DEFAULT_THRESHOLD};
 use crate::sstable::{list_sstables, remove_orphan_tmp, sst_filename, write_sstable, SstReader};
@@ -132,7 +132,7 @@ impl Db {
             threshold,
             bits_per_key: DEFAULT_BITS_PER_KEY,
             versions,
-            strategy: Box::new(SizeTiered::default()),
+            strategy: Box::new(Leveled::default()),
             reader_cache: Mutex::new(HashMap::new()),
             write: Mutex::new(WriteState { wal, active_gen }),
             layers: RwLock::new(Layers { active, immutable: Vec::new(), sstables: Vec::new() }),
@@ -218,7 +218,7 @@ impl Db {
     /// If the strategy selects work, compact fully. Called after an automatic
     /// flush (the write lock must already be released — `compact` reacquires it).
     fn maybe_compact(&self) -> io::Result<()> {
-        if self.strategy.pick(&self.versions.current().files).is_some() {
+        if self.strategy.pick(&self.dir, &self.versions.current().files).is_some() {
             self.compact_all()?;
         }
         Ok(())
@@ -231,7 +231,7 @@ impl Db {
     pub fn compact(&self) -> io::Result<bool> {
         let _w = self.write.lock().expect("write mutex poisoned");
         let files = self.versions.current().files.clone();
-        let Some(compaction) = self.strategy.pick(&files) else {
+        let Some(compaction) = self.strategy.pick(&self.dir, &files) else {
             return Ok(false);
         };
         run_compaction(&self.dir, &self.versions, &compaction, self.bits_per_key)?;

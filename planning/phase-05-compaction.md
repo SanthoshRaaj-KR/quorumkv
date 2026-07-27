@@ -206,33 +206,39 @@ own. Track B (Raft) now builds independently until they meet at Phase 10.
 
 ## 8. Status — what shipped, and what is carried forward
 
-Audited 2026-07-23, before starting Phase 6. The done-when (§6.1–6.3) **passes**
-and 131 tests are green. The MANIFEST, the atomic swap, the orphan sweep, the
-Bloom rebuild, reader-cache eviction, and reads-during-compaction are all real
-and tested. What follows is the honest gap list, so Phase 6 doesn't bury it.
+Audited 2026-07-23, before starting Phase 6; A1+A2 closed 2026-07-27 (128 lib
+tests green plus all integration suites). The done-when (§6.1–6.3) **passes**.
+The MANIFEST, the atomic swap, the orphan sweep, the Bloom rebuild,
+reader-cache eviction, and reads-during-compaction are all real and tested.
+What follows is the honest gap list, so Phase 6 doesn't bury it.
 
 ### Locked decisions not yet implemented
 
 | # | Decision (§7) | Actual | Impact |
 |---|---|---|---|
-| A1 | **Leveled** picker (the stated *target* for the read-heavy workload) | only `SizeTiered` exists | the phase's headline decision is unshipped; §6.7 can't run |
-| A2 | `FileMeta` carries a **key range** (§3: `AddFile(n, level, key-range)`) | `manifest.rs:30` has `number` + `level` only | **blocks A1** — leveled needs ranges for overlap checks. Adding it is a MANIFEST record-format change, so do it *with* A1, not before |
+| A1 | **Leveled** picker (the stated *target* for the read-heavy workload) | **done (2026-07-27):** `compaction::Leveled` — L0 drains into L1 once `l0_trigger` files accumulate; a level ≥1 over `level_file_trigger` promotes one file (plus overlapping next-level neighbors) a level deeper. Wired in as `Db`'s actual default strategy (`db.rs`), replacing `SizeTiered`. `is_bottom_most` computed exactly from key ranges (no file outside the merge, at a deeper level, overlaps the merged range) rather than the old "only if literally everything is included" rule | resolved — §6.7 now runs (see below) |
+| A2 | `FileMeta` carries a **key range** (§3: `AddFile(n, level, key-range)`) | **done (2026-07-27):** `FileMeta.min_key`/`max_key`, populated for free by `SstWriter` (keys already arrive strictly increasing, so first/last added = min/max) and by a one-time `SstReader::key_range()` scan for pre-MANIFEST adoption. MANIFEST wire format grew two length-prefixed fields per added file | resolved, unblocked A1 |
 | A3 | Compaction on a **background thread** | `Db::compact` holds the write mutex for the whole merge (`db.rs:223`) | writes block for the full compaction. §4c's "writes and flushes continue concurrently" is false today. *Reads* do stay live — that part is real |
 | A4 | Files-being-compacted **marking** | absent | moot while A3 serializes everything; becomes mandatory the moment A3 lands |
 | A5 | k-way merge via **min-heap** | linear O(k) scan of all sources per entry (`merge.rs:48`) | correct, but 150 inputs = 150 peeks per output entry |
 
-### Behavioral gap — the tombstone safety path is unreachable
+### Behavioral gap — the tombstone safety path is unreachable (resolved 2026-07-27)
 
-`SizeTiered::pick` (`compaction.rs:63`) always merges **every** live file and
-always sets `is_bottom_most: true`. Three consequences:
+Previously, `SizeTiered::pick` always merged **every** live file and always set
+`is_bottom_most: true`, so:
 
-- It isn't really size-tiered — there's no size bucketing, just "merge
-  everything once ≥ `min_run` files exist."
-- `output_level` is always 0; `FileMeta::level` is written but never read.
-- **`is_bottom_most: false` is unreachable from production code.** The §2
-  tombstone carry-forward rule — "the most important thing in the phase" — is
-  implemented in `merge.rs` and unit-tested via hand-built `Compaction` structs,
-  but no strategy can produce it. It is correct code on a dead path until A1.
+- It wasn't really size-tiered — no size bucketing, just "merge everything
+  once ≥ `min_run` files exist."
+- `output_level` was always 0; `FileMeta::level` was written but never read.
+- **`is_bottom_most: false` was unreachable from production code** — the §2
+  tombstone carry-forward rule ("the most important thing in the phase") only
+  ran against hand-built `Compaction` structs in unit tests.
+
+All three are fixed: `SizeTiered` now buckets by real on-disk file size
+(`compaction::tests::size_tiered_excludes_a_dissimilar_outlier`), and `Leveled`
+makes `is_bottom_most: false` a normal, reachable outcome — proven end-to-end
+through the real picker, not a synthetic struct, in
+`compaction::tests::leveled_carries_tombstone_forward_when_a_deeper_file_still_overlaps`.
 
 ### Test plan coverage
 
@@ -240,10 +246,10 @@ always sets `is_bottom_most: true`. Three consequences:
 |---|---|
 | 1 space drops / 2 latest value | ✅ `compaction_donewhen.rs` (uses 150 rounds, not the doc's literal 1000 — runtime tradeoff; property is proven either way) |
 | 3 delete stays deleted | ✅ end-to-end incl. reopen |
-| **4 tombstone NOT dropped early** | ⚠️ unit-level only, on a synthetic `Compaction`. No `Db`-level version exists *because* it's unreachable (above). The doc calls this "the one that matters most" |
-| **5 crash mid-compaction** | ⚠️ *simulated* — `orphan_compaction_output_is_swept_on_reopen` writes a stray `000999.sst` (`compaction_safety.rs:79`). No real process kill, even though a genuine kill-9 harness already exists (`kill9.rs`). The MANIFEST torn-commit window is untested end-to-end |
+| **4 tombstone NOT dropped early** | ✅ (2026-07-27) — now reachable end-to-end through `Leveled::pick`, not just a synthetic `Compaction` (see above) |
+| **5 crash mid-compaction** | ✅ (resolved by Phase 13, built ahead of this audit) — `storage/tests/faultsim_compaction.rs` induces a real fsync failure mid-compaction over 20 seeds, not a hand-planted orphan file; superseded the `compaction_safety.rs:79` simulation this row originally flagged |
 | 6 concurrent reads | ✅ — but **reads only**. No concurrent *writer* test, which is exactly what A3 would expose |
-| 7 leveled invariant | ⛔ N/A until A1 |
+| 7 leveled invariant | ✅ (2026-07-27) — `leveled_promotes_an_overloaded_level_taking_only_overlapping_neighbors` and `leveled_is_not_bottom_most_when_a_deeper_overlapping_file_survives` exercise the non-overlap/overlap-check machinery directly |
 
 ### Scale
 
@@ -257,7 +263,11 @@ it because they use tiny thresholds.
 
 ### Verdict
 
-Phase 5 is **done-when-complete but decision-incomplete**. Nothing here is
-unsafe for a single-threaded embedded user, and Track B does not depend on any
-of it — so proceeding to Phase 6 is fine. Revisit A1+A2 together (they're one
-change), then A3+A4 together, before Phase 10 wires real traffic through.
+Phase 5 is **done-when-complete**; A1+A2 (2026-07-27) closed the headline
+decision-incompleteness this section originally flagged. What's left —
+A3+A4 (background-thread compaction + files-being-compacted marking) and the
+A5/RAM-materialization performance items — is not a correctness gap: nothing
+here is unsafe for a single-threaded embedded user, and Track B does not
+depend on any of it. A3+A4 next, before real concurrent write traffic
+(Phase 10 already wired) exercises the "writes block during compaction"
+behavior in anger.
