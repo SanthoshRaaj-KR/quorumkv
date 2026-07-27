@@ -16,7 +16,7 @@ use storage::sstable::sst_filename;
 #[test]
 fn concurrent_reads_during_compaction_are_correct() {
     let dir = TempDir::new();
-    let db = Arc::new(Db::open(&dir.0).unwrap());
+    let db = Db::open(&dir.0).unwrap(); // already Arc<Db> (phase-05 §8 A3)
 
     // Seed several generations of 100 keys, each flushed to its own SSTable, so
     // the final value of key i is "final-i".

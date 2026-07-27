@@ -21,7 +21,7 @@ fn concurrent_writers_no_lost_updates_and_durable() {
 
     let dir = TempDir::new();
     // Small threshold: forces many flushes while the writers are running.
-    let db = Arc::new(Db::open_with_threshold(&dir.0, 8 * 1024).unwrap());
+    let db = Db::open_with_threshold(&dir.0, 8 * 1024).unwrap(); // already Arc<Db> (phase-05 §8 A3)
 
     let mut handles: Vec<_> = (0..THREADS)
         .map(|t| {
@@ -59,6 +59,12 @@ fn concurrent_writers_no_lost_updates_and_durable() {
     }
 
     // ...and durable: a reopen (reload SSTables + replay WAL) is identical.
+    // A background compaction (phase-05 §8 A3) spawned by one of the writers'
+    // flushes can still be running after they all join — it holds its own
+    // `Arc<Db>` clone, so `drop(db)` alone wouldn't stop it from still
+    // touching this same directory while the reopen below is also reading
+    // it. Drain it first.
+    db.wait_for_compactions();
     drop(db);
     let reopened = Db::open(&dir.0).unwrap();
     assert_eq!(reopened.len().unwrap(), THREADS * PER);

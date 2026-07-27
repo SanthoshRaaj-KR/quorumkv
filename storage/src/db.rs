@@ -10,16 +10,27 @@
 //!
 //! ## Concurrency
 //!
-//! `put`/`delete`/`get` take `&self`. Writes and version-changing operations
-//! (flush, compaction) serialize on `Mutex<WriteState>`; the read view is a
-//! separate `RwLock<Layers>` write-locked only for brief tier swaps — reads never
-//! block on an fsync, a flush, or a compaction's merge.
+//! `put`/`delete`/`get` take `&self`. Writes (WAL append + memtable + the
+//! flush that seals a full memtable) serialize on `Mutex<WriteState>`; the
+//! read view is a separate `RwLock<Layers>` write-locked only for brief tier
+//! swaps — reads never block on an fsync, a flush, or a compaction's merge.
+//!
+//! Compaction (phase-05 §4c/§8 A3) does **not** hold `Mutex<WriteState>` at
+//! all: an automatic (threshold-triggered) flush hands its compaction off to
+//! a background thread (`maybe_compact`), and even a direct [`Db::compact`]
+//! call only takes the write lock implicitly (it doesn't need to — merging
+//! and writing the output touch only immutable inputs and a fresh output
+//! file). What *does* need coordinating is two compactions racing to pick
+//! the same input file — `compacting: Mutex<HashSet<u64>>` closes that gap
+//! (§8 A4) by hiding claimed files from the picker until the claiming
+//! compaction finishes, success or failure.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex, RwLock, Weak};
+use std::thread;
 
 use crate::bloom::DEFAULT_BITS_PER_KEY;
 use crate::compaction::{run_compaction, CompactionStrategy, Leveled};
@@ -42,6 +53,20 @@ pub struct Db {
     reader_cache: Mutex<HashMap<u64, Arc<SstReader>>>,
     write: Mutex<WriteState>,
     layers: RwLock<Layers>,
+    /// File numbers currently claimed as inputs to an in-flight compaction —
+    /// hidden from the picker so a foreground [`Db::compact`] call and a
+    /// background one spawned by `maybe_compact` never select overlapping
+    /// inputs (phase-05 §8 A4).
+    compacting: Mutex<HashSet<u64>>,
+    /// Handles for background compactions spawned by `maybe_compact` (§8 A3).
+    /// Pruned opportunistically; [`Db::wait_for_compactions`] drains
+    /// whatever's left for a caller that's about to do something unsafe to
+    /// race with an in-flight compaction on this directory.
+    bg_compactions: Mutex<Vec<thread::JoinHandle<()>>>,
+    /// Lets `maybe_compact` hand a spawned background thread a real, strong
+    /// `Arc<Db>` without changing `put`/`delete`'s `&self` signature —
+    /// populated once at construction via `Arc::new_cyclic`.
+    self_weak: Weak<Db>,
 }
 
 /// State only writers touch: the active WAL segment and its generation number.
@@ -60,12 +85,18 @@ struct Layers {
 
 impl Db {
     /// Open (creating if absent) the store rooted at directory `dir`.
-    pub fn open(dir: impl AsRef<Path>) -> io::Result<Self> {
+    ///
+    /// Returns `Arc<Db>` rather than a bare `Db`: compaction can run on a
+    /// genuine background thread (phase-05 §8 A3), which needs a real owning
+    /// handle to outlive the call that triggered it. `Arc<Db>` derefs
+    /// transparently, so existing `db.get(...)`/`db.put(...)` call sites are
+    /// unaffected.
+    pub fn open(dir: impl AsRef<Path>) -> io::Result<Arc<Self>> {
         Self::open_with_threshold(dir, DEFAULT_THRESHOLD)
     }
 
     /// Open with an explicit memtable flush threshold (tests use a tiny value).
-    pub fn open_with_threshold(dir: impl AsRef<Path>, threshold: usize) -> io::Result<Self> {
+    pub fn open_with_threshold(dir: impl AsRef<Path>, threshold: usize) -> io::Result<Arc<Self>> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(&dir)?;
         log::info!(target: "db", "opening {}", dir.display());
@@ -127,7 +158,7 @@ impl Db {
             active_gen,
         );
 
-        let db = Db {
+        let db = Arc::new_cyclic(|weak| Db {
             dir,
             threshold,
             bits_per_key: DEFAULT_BITS_PER_KEY,
@@ -136,7 +167,10 @@ impl Db {
             reader_cache: Mutex::new(HashMap::new()),
             write: Mutex::new(WriteState { wal, active_gen }),
             layers: RwLock::new(Layers { active, immutable: Vec::new(), sstables: Vec::new() }),
-        };
+            compacting: Mutex::new(HashSet::new()),
+            bg_compactions: Mutex::new(Vec::new()),
+            self_weak: weak.clone(),
+        });
         db.refresh_sstable_view()?;
         Ok(db)
     }
@@ -156,7 +190,7 @@ impl Db {
             }
         };
         if flushed {
-            self.maybe_compact()?; // note: write lock released above
+            self.maybe_compact(); // note: write lock released above; runs in the background
         }
         Ok(())
     }
@@ -175,7 +209,7 @@ impl Db {
             }
         };
         if flushed {
-            self.maybe_compact()?;
+            self.maybe_compact();
         }
         Ok(())
     }
@@ -215,25 +249,64 @@ impl Db {
         self.freeze_and_flush(&mut w, &active)
     }
 
-    /// If the strategy selects work, compact fully. Called after an automatic
-    /// flush (the write lock must already be released — `compact` reacquires it).
-    fn maybe_compact(&self) -> io::Result<()> {
-        if self.strategy.pick(&self.dir, &self.versions.current().files).is_some() {
-            self.compact_all()?;
+    /// If the strategy selects work, spawn a background thread to compact
+    /// fully (phase-05 §8 A3). Called after an automatic flush (the write
+    /// lock must already be released) — this is what lets a `put`/`delete`
+    /// that triggered a flush return immediately instead of blocking on
+    /// however long the resulting compaction takes. A failure is logged, not
+    /// propagated: there's no synchronous caller left to hand it to by the
+    /// time the background thread runs.
+    fn maybe_compact(&self) {
+        if self.strategy.pick(&self.dir, &self.available_files()).is_none() {
+            return;
         }
-        Ok(())
+        // Upgrade our own weak self-reference to a strong one to move into
+        // the thread. If it fails, this Db is already being torn down —
+        // don't start new background work for something about to vanish.
+        let Some(db) = self.self_weak.upgrade() else {
+            return;
+        };
+        let handle = thread::spawn(move || {
+            if let Err(e) = db.compact_all() {
+                log::error!(target: "db", "background compaction failed: {e}");
+            }
+        });
+        let mut handles = self.bg_compactions.lock().expect("bg_compactions poisoned");
+        handles.retain(|h| !h.is_finished());
+        handles.push(handle);
+    }
+
+    /// The live file set minus whatever's currently claimed by another
+    /// in-flight compaction (phase-05 §8 A4) — what the picker is allowed to
+    /// choose from right now.
+    fn available_files(&self) -> Vec<FileMeta> {
+        let claimed = self.compacting.lock().expect("compacting set poisoned");
+        self.versions.current().files.iter().filter(|f| !claimed.contains(&f.number)).cloned().collect()
     }
 
     /// Run one compaction if the strategy selects work; returns whether it did.
     ///
-    /// Synchronous: holds the write lock for the duration (so it serializes with
-    /// flushes). Reads run throughout against their `Arc` snapshot.
+    /// Does **not** take the write lock — a `put`/`delete`/`flush` on another
+    /// thread proceeds independently of however long this merge takes
+    /// (phase-05 §8 A3). Safe to call concurrently with itself (including
+    /// from a background thread `maybe_compact` spawned): `compacting`
+    /// claims this call's chosen inputs before the merge starts, so a
+    /// concurrent call's own pick never selects the same files (§8 A4).
+    /// Reads run throughout against their own `Arc` snapshot.
     pub fn compact(&self) -> io::Result<bool> {
-        let _w = self.write.lock().expect("write mutex poisoned");
-        let files = self.versions.current().files.clone();
+        let files = self.available_files();
         let Some(compaction) = self.strategy.pick(&self.dir, &files) else {
             return Ok(false);
         };
+
+        {
+            let mut claiming = self.compacting.lock().expect("compacting set poisoned");
+            for &n in &compaction.inputs {
+                claiming.insert(n);
+            }
+        }
+        let _guard = CompactingGuard { db: self, numbers: &compaction.inputs };
+
         run_compaction(&self.dir, &self.versions, &compaction, self.bits_per_key)?;
         self.refresh_sstable_view()?;
         Ok(true)
@@ -243,6 +316,21 @@ impl Db {
     pub fn compact_all(&self) -> io::Result<()> {
         while self.compact()? {}
         Ok(())
+    }
+
+    /// Block until every background compaction spawned by `maybe_compact` so
+    /// far has finished. Callers must call this before anything that isn't
+    /// safe to race with an in-flight compaction on this directory — most
+    /// notably [`Db::restore`], which wipes the directory outright and has
+    /// no way to know about a separate, still-live `Db` handle over the same
+    /// path (this is why the sidecar's own `/restore` handler calls this on
+    /// its old handle before restoring).
+    pub fn wait_for_compactions(&self) {
+        let handles: Vec<_> =
+            std::mem::take(&mut *self.bg_compactions.lock().expect("bg_compactions poisoned"));
+        for h in handles {
+            let _ = h.join();
+        }
     }
 
     /// Number of live keys across all tiers (tombstones excluded). O(total entries).
@@ -295,7 +383,7 @@ impl Db {
     /// SSTables but no MANIFEST is exactly the pre-Phase-5 shape [`Db::open`]
     /// already knows how to adopt (as one level-0 version), so restore reuses
     /// that path instead of duplicating MANIFEST-writing logic.
-    pub fn restore(dir: impl AsRef<Path>, blob: &[u8]) -> io::Result<Db> {
+    pub fn restore(dir: impl AsRef<Path>, blob: &[u8]) -> io::Result<Arc<Db>> {
         let dir = dir.as_ref();
         if dir.exists() {
             fs::remove_dir_all(dir)?;
@@ -423,6 +511,23 @@ impl Db {
     }
 }
 
+/// Un-claims a compaction's input files when dropped — covers both the
+/// success path and an early `?` return from `run_compaction`/
+/// `refresh_sstable_view` failing partway through (phase-05 §8 A4).
+struct CompactingGuard<'a> {
+    db: &'a Db,
+    numbers: &'a [u64],
+}
+
+impl Drop for CompactingGuard<'_> {
+    fn drop(&mut self) {
+        let mut claiming = self.db.compacting.lock().expect("compacting set poisoned");
+        for n in self.numbers {
+            claiming.remove(n);
+        }
+    }
+}
+
 /// Flatten an on-disk/in-memory marker into a read result.
 fn marker_to_value(v: Value) -> Option<Vec<u8>> {
     match v {
@@ -457,10 +562,10 @@ mod tests {
     use crate::testutil::TempDir;
 
     // Each test's store lives in its own temp dir.
-    fn open(dir: &TempDir) -> Db {
+    fn open(dir: &TempDir) -> Arc<Db> {
         Db::open(&dir.0).unwrap()
     }
-    fn open_small(dir: &TempDir, threshold: usize) -> Db {
+    fn open_small(dir: &TempDir, threshold: usize) -> Arc<Db> {
         Db::open_with_threshold(&dir.0, threshold).unwrap()
     }
 

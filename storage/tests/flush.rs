@@ -54,6 +54,11 @@ fn all_keys_read_back_after_restart() {
         for i in 0..600u32 {
             db.put(format!("k{i:05}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
         }
+        // A small threshold means auto-compaction (phase-05 §8 A3) likely
+        // triggered in the background; it holds its own `Arc<Db>` clone, so
+        // this scope ending alone wouldn't stop it before the reopen below
+        // touches the same directory.
+        db.wait_for_compactions();
     }
     let db = Db::open(&dir.0).unwrap();
     assert_eq!(db.len().unwrap(), 600);

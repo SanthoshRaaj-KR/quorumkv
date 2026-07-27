@@ -21,6 +21,7 @@
 use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::sync::Arc;
 
 use storage::db::Db;
 
@@ -61,8 +62,10 @@ fn main() {
 /// Read one request, dispatch it, write back one response. `db` is `&mut`
 /// only because `/restore` replaces the whole store (a fresh `Db` over a
 /// wiped directory) — safe with no locking because connections are handled
-/// strictly one at a time.
-fn handle(mut stream: TcpStream, db: &mut Db, dir: &str) -> io::Result<()> {
+/// strictly one at a time. `Arc<Db>` (not a bare `Db`) since Phase 5's
+/// background compaction (§8 A3) needs a real owning handle that can outlive
+/// the `put`/`delete` call that spawned it.
+fn handle(mut stream: TcpStream, db: &mut Arc<Db>, dir: &str) -> io::Result<()> {
     let mut reader = BufReader::new(stream.try_clone()?);
 
     let mut request_line = String::new();
@@ -103,7 +106,7 @@ fn handle(mut stream: TcpStream, db: &mut Db, dir: &str) -> io::Result<()> {
     stream.flush()
 }
 
-fn route(method: &str, path: &str, body: &str, db: &mut Db, dir: &str) -> (&'static str, String) {
+fn route(method: &str, path: &str, body: &str, db: &mut Arc<Db>, dir: &str) -> (&'static str, String) {
     match (method, path) {
         ("POST", "/put") => handle_put(body, db),
         ("POST", "/delete") => handle_delete(body, db),
@@ -165,13 +168,22 @@ fn handle_snapshot(db: &Db) -> (&'static str, String) {
 /// Replace `*db` entirely with a fresh store restored from the blob — see
 /// [`Db::restore`]: it wipes `dir` first (an installed snapshot is
 /// authoritative), so whatever this sidecar held before is gone.
-fn handle_restore(body: &str, db: &mut Db, dir: &str) -> (&'static str, String) {
+///
+/// [`Db::restore`] is a plain associated function — it has no way to know
+/// about *this* process's separate, still-live `Db` handle over the same
+/// directory, so if a background compaction (§8 A3) were still merging
+/// files there when the wipe happens, that would be a real, silent
+/// directory-out-from-under-a-running-merge race. `wait_for_compactions`
+/// drains it first, on the OLD handle, before `Db::restore` ever touches
+/// disk.
+fn handle_restore(body: &str, db: &mut Arc<Db>, dir: &str) -> (&'static str, String) {
     let Some(d) = json::get_str(body, "data") else {
         return ("400 Bad Request", json_error("missing data"));
     };
     let Ok(blob) = base64::decode(&d) else {
         return ("400 Bad Request", json_error("invalid base64"));
     };
+    db.wait_for_compactions();
     match Db::restore(dir, &blob) {
         Ok(new_db) => {
             *db = new_db;
