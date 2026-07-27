@@ -62,6 +62,91 @@ fn concurrent_reads_during_compaction_are_correct() {
     }
 }
 
+/// phase-05 §8 A3's proof: a concurrent *writer* survives an in-flight
+/// compaction — previously only "reads survive" was tested (above).
+/// `Db::compact` no longer takes the write lock, so a writer thread's
+/// `put`s (WAL append + memtable write) must proceed the whole time the
+/// main thread's slow disk merge is running, not block on it.
+#[test]
+fn concurrent_writer_survives_compaction() {
+    let dir = TempDir::new();
+    let db = Db::open(&dir.0).unwrap(); // already Arc<Db> (phase-05 §8 A3)
+
+    // Four generations of the same 100 keys, each flushed to its own
+    // SSTable — exactly what `compact_all` below will merge.
+    for gen in 0..4u32 {
+        for i in 0..100u32 {
+            let v = if gen == 3 { format!("final-{i}") } else { format!("g{gen}-{i}") };
+            db.put(format!("k{i:03}").as_bytes(), v.as_bytes()).unwrap();
+        }
+        db.flush().unwrap();
+    }
+
+    // A writer thread putting brand-new keys the whole time — untouched by
+    // the compaction below, which only covers the four generations already
+    // on disk.
+    let writer = {
+        let db = Arc::clone(&db);
+        thread::spawn(move || {
+            for i in 0..500u32 {
+                db.put(format!("new-{i:04}").as_bytes(), format!("v{i}").as_bytes()).unwrap();
+            }
+        })
+    };
+
+    db.compact_all().unwrap();
+    writer.join().unwrap();
+
+    // The compacted generations still hold their final values...
+    for i in 0..100u32 {
+        assert_eq!(
+            db.get(format!("k{i:03}").as_bytes()).unwrap(),
+            Some(format!("final-{i}").into_bytes()),
+        );
+    }
+    // ...and every write the concurrent writer made survived too — neither
+    // side lost anything or blocked the other out.
+    for i in 0..500u32 {
+        assert_eq!(db.get(format!("new-{i:04}").as_bytes()).unwrap(), Some(format!("v{i}").into_bytes()));
+    }
+}
+
+/// phase-05 §8 A4's proof: a background compaction (spawned by an
+/// auto-triggered flush, §8 A3) and a directly-invoked `Db::compact` racing
+/// on the same store must never select overlapping input files. If they
+/// did, the loser would try to merge or delete a file the winner already
+/// removed — surfacing here as an I/O error or, worse, silent data loss.
+/// Heavy contention (a steady stream of small flushes plus a tight
+/// `compact()` loop) makes an unguarded collision very likely to show up.
+#[test]
+fn concurrent_compactions_never_collide_on_the_same_input() {
+    let dir = TempDir::new();
+    let db = Db::open_with_threshold(&dir.0, 2048).unwrap();
+
+    let writer = {
+        let db = Arc::clone(&db);
+        thread::spawn(move || {
+            for i in 0..2_000u32 {
+                db.put(format!("k{i:05}").as_bytes(), b"value").unwrap();
+            }
+        })
+    };
+
+    // Hammer `compact()` directly on this thread, racing whatever
+    // background compaction `maybe_compact` happens to have spawned.
+    for _ in 0..200 {
+        db.compact().unwrap();
+    }
+
+    writer.join().unwrap();
+    db.wait_for_compactions();
+    db.compact_all().unwrap();
+
+    for i in 0..2_000u32 {
+        assert_eq!(db.get(format!("k{i:05}").as_bytes()).unwrap(), Some(b"value".to_vec()), "key k{i:05} lost or corrupted");
+    }
+}
+
 /// §6.5 — a compaction that crashed before its MANIFEST commit leaves an orphan
 /// output SSTable (never referenced). On reopen the MANIFEST names the old,
 /// consistent set and the orphan is swept — no corruption, no loss.
