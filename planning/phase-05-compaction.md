@@ -263,11 +263,10 @@ it because they use tiny thresholds.
 
 ### Verdict
 
-Phase 5 is **done-when-complete**; A1+A2 (2026-07-27) closed the headline
-decision-incompleteness this section originally flagged. What's left —
-A3+A4 (background-thread compaction + files-being-compacted marking) and the
-A5/RAM-materialization performance items — is not a correctness gap: nothing
-here is unsafe for a single-threaded embedded user, and Track B does not
-depend on any of it. A3+A4 next, before real concurrent write traffic
-(Phase 10 already wired) exercises the "writes block during compaction"
-behavior in anger.
+Phase 5 is **done-when-complete and decision-complete** as of 2026-07-27:
+A1+A2 (leveled compaction + key ranges) and A3+A4 (background-thread
+compaction + files-being-compacted marking) are all built and tested. All
+that's left is the A5/RAM-materialization performance pair — not a
+correctness gap: nothing here is unsafe, and nothing downstream (Track B,
+Phase 10's real traffic) depends on it. Worth a pass if compaction ever shows
+up as a real bottleneck under production-sized files, not before.
