@@ -27,7 +27,7 @@ Every phase file has the same shape:
 | 2 | [phase-02-memtable.md](phase-02-memtable.md) | In-memory sorted layer | decisions locked |
 | 3 | [phase-03-sstable.md](phase-03-sstable.md) | Flush to immutable disk file | decisions locked |
 | 4 | [phase-04-bloom.md](phase-04-bloom.md) | Skip files you don't need | decisions locked |
-| 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | locked; **built ✅** (leveled shipped 2026-07-27); **§8 carry-forward**: background-thread compaction (A3/A4) still open |
+| 5 | [phase-05-compaction.md](phase-05-compaction.md) | Storage-engine GC | **built ✅** — leveled compaction + background-thread compaction all shipped 2026-07-27; only the A5 performance pair (min-heap merge, RAM materialization) remains, non-blocking |
 | 6 | [phase-06-raft-single.md](phase-06-raft-single.md) | Raft state machine, isolated | **built** ✅ |
 | 7 | [phase-07-election.md](phase-07-election.md) | Leader election over RPC | **built** ✅ |
 | 8 | [phase-08-replication.md](phase-08-replication.md) | Agree on one ordered log | **built** ✅ |
@@ -67,7 +67,7 @@ never re-litigate. `DESIGN.md` §7 / `ROADMAP.md` "Open decisions" seed this.
 | Compaction strategy | 5 | size-tiered first, **leveled target** (read-heavy), pluggable | locked, **both built** — `Leveled` is `Db`'s default (2026-07-27) |
 | Tombstone GC safety | 5 | drop only at bottom-most level, else carry forward | locked |
 | File-set tracking | 5 | MANIFEST (append-only version edits) | locked |
-| Compaction concurrency | 5 | background thread, Arc'd Version, deferred file delete | locked; **bg thread not yet built** (§8 A3) |
+| Compaction concurrency | 5 | background thread, Arc'd Version, deferred file delete | locked, **built** (2026-07-27) — `Db::maybe_compact` spawns a real thread; `Db.compacting` marks in-flight input files (§8 A3/A4) |
 | Raft core style | 6 | deterministic driven core (etcd model) — no timers/goroutines/IO inside | locked |
 | Raft driver contract | 6 | persist+fsync → send → apply → Advance | locked |
 | Raft log indexing | 6 | dummy sentinel {0,0}; access via `Log` methods only | locked |
